@@ -1,0 +1,281 @@
+"""Table-driven tests for the pure routing policy.
+
+Every transition and every guard rejection listed in the plan gets a row
+here. `decide()` takes no I/O, so these are the cheapest, highest-signal
+tests in the system — if this file is green, the state machine cannot
+skip a gate no matter what an agent's prose says.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from devloop.contracts.artifacts import (
+    Finding,
+    FindingCategory,
+    RequirementResult,
+    RequirementStatus,
+    ReviewResult,
+    Severity,
+    TestFailure,
+    TestRunResult,
+    Verdict,
+)
+from devloop.contracts.state import DevLoopState
+from devloop.contracts.status import DevLoopStatus as St
+from devloop.graph.routing import decide
+
+
+def make_state(status: St, **overrides: Any) -> DevLoopState:
+    base: DevLoopState = {
+        "status": status,
+        "iteration": 0,
+        "replan_count": 0,
+        "cost_usd": 0.0,
+        "budget_usd": 20.0,
+        "baseline": [],
+        "verification": [],
+        "feedback": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def req(status: RequirementStatus) -> RequirementResult:
+    return RequirementResult(status=status, summary="x")
+
+
+def review(verdict: Verdict, findings: list[Finding] | None = None) -> ReviewResult:
+    return ReviewResult(verdict=verdict, findings=findings or [])
+
+
+def make_test_run(name: str, passed: bool) -> TestRunResult:
+    return TestRunResult(
+        type="unit",
+        command="pytest",
+        phase="post_change",
+        passed=passed,
+        failures=[] if passed else [TestFailure(name=name, message="boom")],
+    )
+
+
+CASES: list[tuple[str, DevLoopState, St]] = [
+    (
+        "received with no requirements needs clarification",
+        make_state(St.RECEIVED),
+        St.CLARIFICATION_REQUIRED,
+    ),
+    (
+        "received with ready requirements skips straight to planning",
+        make_state(St.RECEIVED, requirements=req(RequirementStatus.READY)),
+        St.PLANNING,
+    ),
+    (
+        "clarification stays put until an answer arrives",
+        make_state(St.CLARIFICATION_REQUIRED),
+        St.CLARIFICATION_REQUIRED,
+    ),
+    (
+        "clarification with a still-unready answer stays put",
+        make_state(
+            St.CLARIFICATION_REQUIRED,
+            requirements=req(RequirementStatus.NEEDS_CLARIFICATION),
+        ),
+        St.CLARIFICATION_REQUIRED,
+    ),
+    (
+        "clarification resolved moves to planning",
+        make_state(St.CLARIFICATION_REQUIRED, requirements=req(RequirementStatus.READY)),
+        St.PLANNING,
+    ),
+    (
+        "planning without a plan stays put",
+        make_state(St.PLANNING),
+        St.PLANNING,
+    ),
+    (
+        "plan ready with no cached env goes to bootstrap",
+        make_state(St.PLAN_READY, env=None),
+        St.ENV_BOOTSTRAP,
+    ),
+    (
+        "bootstrap without a recipe escalates rather than proceeding blind",
+        make_state(St.ENV_BOOTSTRAP),
+        St.ESCALATED,
+    ),
+    (
+        "baseline always proceeds to implementing, even with pre-existing failures",
+        make_state(St.BASELINE, baseline=[make_test_run("already_broken", False)]),
+        St.IMPLEMENTING,
+    ),
+    (
+        "implementing without a diff stays put",
+        make_state(St.IMPLEMENTING),
+        St.IMPLEMENTING,
+    ),
+    (
+        "testing always proceeds to reviewing",
+        make_state(St.TESTING),
+        St.REVIEWING,
+    ),
+    (
+        "review approved with no new failures finalizes",
+        make_state(St.REVIEWING, review=review(Verdict.APPROVED)),
+        St.READY_FOR_FINALIZE,
+    ),
+    (
+        "review approved but a NEW failure appeared blocks finalize",
+        make_state(
+            St.REVIEWING,
+            review=review(Verdict.APPROVED),
+            baseline=[make_test_run("already_broken", False)],
+            verification=[
+                make_test_run("already_broken", False),
+                make_test_run("new_break", False),
+            ],
+        ),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "review approved with only pre-existing failures still finalizes",
+        make_state(
+            St.REVIEWING,
+            review=review(Verdict.APPROVED),
+            baseline=[make_test_run("already_broken", False)],
+            verification=[make_test_run("already_broken", False)],
+        ),
+        St.READY_FOR_FINALIZE,
+    ),
+    (
+        "review changes_requested loops back",
+        make_state(St.REVIEWING, review=review(Verdict.CHANGES_REQUESTED)),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "changes_required under the iteration cap goes back to implementing",
+        make_state(St.CHANGES_REQUIRED, iteration=1),
+        St.IMPLEMENTING,
+    ),
+    (
+        "changes_required at the iteration cap escalates",
+        make_state(St.CHANGES_REQUIRED, iteration=3),
+        St.ESCALATED,
+    ),
+    (
+        "changes_required with an unresolved plan-conformance finding replans",
+        make_state(
+            St.CHANGES_REQUIRED,
+            iteration=1,
+            replan_count=0,
+            feedback=[
+                Finding(
+                    id="f1",
+                    severity=Severity.P1,
+                    category=FindingCategory.PLAN_CONFORMANCE,
+                    description="diverged",
+                    recommendation="replan",
+                )
+            ],
+        ),
+        St.REPLANNING,
+    ),
+    (
+        "changes_required with plan-conformance finding but replans exhausted escalates",
+        make_state(
+            St.CHANGES_REQUIRED,
+            iteration=1,
+            replan_count=2,
+            feedback=[
+                Finding(
+                    id="f1",
+                    severity=Severity.P1,
+                    category=FindingCategory.PLAN_CONFORMANCE,
+                    description="diverged",
+                    recommendation="replan",
+                )
+            ],
+        ),
+        St.ESCALATED,
+    ),
+    (
+        "changes_required ignores an already-resolved plan-conformance finding",
+        make_state(
+            St.CHANGES_REQUIRED,
+            iteration=1,
+            feedback=[
+                Finding(
+                    id="f1",
+                    severity=Severity.P1,
+                    category=FindingCategory.PLAN_CONFORMANCE,
+                    description="diverged",
+                    recommendation="replan",
+                    resolved=True,
+                )
+            ],
+        ),
+        St.IMPLEMENTING,
+    ),
+    (
+        "replanning without a plan stays put",
+        make_state(St.REPLANNING),
+        St.REPLANNING,
+    ),
+    (
+        "ready_for_finalize is a stable human-gated wait state",
+        make_state(St.READY_FOR_FINALIZE),
+        St.READY_FOR_FINALIZE,
+    ),
+    (
+        "escalated is terminal-ish and self-stable",
+        make_state(St.ESCALATED),
+        St.ESCALATED,
+    ),
+    (
+        "cancelled never resumes",
+        make_state(St.CANCELLED),
+        St.CANCELLED,
+    ),
+    (
+        "finalized never resumes",
+        make_state(St.FINALIZED),
+        St.FINALIZED,
+    ),
+    (
+        "failed never resumes",
+        make_state(St.FAILED),
+        St.FAILED,
+    ),
+    (
+        "budget breach escalates from an in-flight status regardless of local facts",
+        make_state(St.IMPLEMENTING, cost_usd=25.0, budget_usd=20.0),
+        St.ESCALATED,
+    ),
+    (
+        "budget breach does not override a human-gated wait state",
+        make_state(St.READY_FOR_FINALIZE, cost_usd=25.0, budget_usd=20.0),
+        St.READY_FOR_FINALIZE,
+    ),
+    (
+        "no budget configured never triggers the guard",
+        make_state(St.IMPLEMENTING, cost_usd=999.0, budget_usd=None),
+        St.IMPLEMENTING,
+    ),
+]
+
+
+@pytest.mark.parametrize("name,state,expected", CASES, ids=[c[0] for c in CASES])
+def test_decide(name: str, state: DevLoopState, expected: St) -> None:
+    assert decide(state) == expected, name
+
+
+def test_decide_is_pure_and_idempotent() -> None:
+    """Calling decide() twice on the same state must be side-effect-free
+    and must return the same answer both times — a property the LangGraph
+    interrupt() re-execution caveat depends on for `clarify`/`finalize`."""
+
+    state = make_state(St.REVIEWING, review=review(Verdict.APPROVED))
+    first = decide(state)
+    second = decide(state)
+    assert first == second == St.READY_FOR_FINALIZE
