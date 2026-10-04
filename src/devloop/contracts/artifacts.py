@@ -31,9 +31,18 @@ class RequirementResult(BaseModel):
     questions: list[str] = Field(default_factory=list)
 
 
+class FileAction(StrEnum):
+    MODIFY = "modify"
+    CREATE = "create"
+    DELETE = "delete"
+
+
 class FileToChange(BaseModel):
     path: str
     reason: str
+    # `modify`/`delete` must name a file that exists at the base commit;
+    # `create` must not. Checked deterministically before implementing.
+    action: FileAction = FileAction.MODIFY
 
 
 class TestPlanItem(BaseModel):
@@ -100,6 +109,34 @@ class Deviation(BaseModel):
     why: str
 
 
+class PlanInvalidation(BaseModel):
+    """The Developer's way to say "this plan cannot work" with evidence,
+    instead of silently drifting from it. Routes to REPLANNING."""
+
+    reason: str
+    evidence: str
+
+
+class FindingDispute(BaseModel):
+    """The Developer declining a finding — typically because it contradicts
+    the requirements. Escalated to a human when nothing else changed."""
+
+    finding_id: str
+    reason: str
+
+
+class ImplementationResult(BaseModel):
+    """Written by the Developer. The orchestrator — not the agent — commits
+    the working tree afterwards, so the diff itself is a measured fact and
+    this document only carries what the diff cannot say."""
+
+    summary: str
+    deviations: list[Deviation] = Field(default_factory=list)
+    plan_invalid: PlanInvalidation | None = None
+    disputed_findings: list[FindingDispute] = Field(default_factory=list)
+    notes_for_reviewer: str = ""
+
+
 class ServiceSpec(BaseModel):
     name: str  # e.g. "postgres"
     image: str
@@ -134,6 +171,9 @@ class TestRunResult(BaseModel):
     type: str  # "lint" | "typecheck" | "unit" | "integration" | "e2e"
     command: str
     phase: str  # "baseline" | "post_change"
+    # implementation attempt this run verified (0 for baseline); the
+    # regression gate compares only the latest attempt against baseline.
+    iteration: int = 0
     passed: bool
     output: str = ""
     duration_ms: int = 0

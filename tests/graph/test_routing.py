@@ -13,8 +13,13 @@ from typing import Any
 import pytest
 
 from devloop.contracts.artifacts import (
+    Deviation,
+    EnvRecipe,
     Finding,
     FindingCategory,
+    ImplementationResult,
+    PlanInvalidation,
+    PlanResult,
     RequirementResult,
     RequirementStatus,
     ReviewResult,
@@ -23,7 +28,7 @@ from devloop.contracts.artifacts import (
     TestRunResult,
     Verdict,
 )
-from devloop.contracts.state import DevLoopState
+from devloop.contracts.state import DevLoopState, DiffSummary
 from devloop.contracts.status import DevLoopStatus as St
 from devloop.graph.routing import decide
 
@@ -51,15 +56,56 @@ def review(verdict: Verdict, findings: list[Finding] | None = None) -> ReviewRes
     return ReviewResult(verdict=verdict, findings=findings or [])
 
 
-def make_test_run(name: str, passed: bool) -> TestRunResult:
+def make_test_run(
+    name: str,
+    passed: bool,
+    *,
+    type_: str = "unit",
+    iteration: int = 1,
+    parsed: bool = True,
+) -> TestRunResult:
     return TestRunResult(
-        type="unit",
+        type=type_,
         command="pytest",
         phase="post_change",
+        iteration=iteration,
         passed=passed,
-        failures=[] if passed else [TestFailure(name=name, message="boom")],
+        failures=[] if passed or not parsed else [TestFailure(name=name, message="boom")],
     )
 
+
+def finding(
+    category: FindingCategory = FindingCategory.CORRECTNESS,
+    severity: Severity = Severity.P1,
+    resolved: bool = False,
+) -> Finding:
+    return Finding(
+        id="f1",
+        severity=severity,
+        category=category,
+        description="d",
+        recommendation="r",
+        resolved=resolved,
+    )
+
+
+def recipe(commands: dict[str, str] | None = None) -> EnvRecipe:
+    return EnvRecipe(
+        image="host",
+        commands={"unit": "pytest"} if commands is None else commands,
+        verified_at_commit="abc",
+    )
+
+
+def implementation(plan_invalid: bool = False) -> ImplementationResult:
+    return ImplementationResult(
+        summary="s",
+        deviations=[Deviation(step="1", what_changed="x", why="y")],
+        plan_invalid=PlanInvalidation(reason="r", evidence="e") if plan_invalid else None,
+    )
+
+
+_PLAN = PlanResult(summary="p")
 
 CASES: list[tuple[str, DevLoopState, St]] = [
     (
@@ -116,8 +162,8 @@ CASES: list[tuple[str, DevLoopState, St]] = [
         St.IMPLEMENTING,
     ),
     (
-        "testing always proceeds to reviewing",
-        make_state(St.TESTING),
+        "testing with no failures proceeds to reviewing",
+        make_state(St.TESTING, verification=[make_test_run("t", True)]),
         St.REVIEWING,
     ),
     (
@@ -261,6 +307,128 @@ CASES: list[tuple[str, DevLoopState, St]] = [
         "no budget configured never triggers the guard",
         make_state(St.IMPLEMENTING, cost_usd=999.0, budget_usd=None),
         St.IMPLEMENTING,
+    ),
+    # --- Phase 2 ---------------------------------------------------------
+    (
+        "received with requirements that need clarification pauses for a human",
+        make_state(St.RECEIVED, requirements=req(RequirementStatus.NEEDS_CLARIFICATION)),
+        St.CLARIFICATION_REQUIRED,
+    ),
+    (
+        "a failed side effect escalates from an in-flight status",
+        make_state(St.PLANNING, escalation_reason="planner crashed"),
+        St.ESCALATED,
+    ),
+    (
+        "a failed side effect does not override a human-gated wait state",
+        make_state(St.READY_FOR_FINALIZE, escalation_reason="stale"),
+        St.READY_FOR_FINALIZE,
+    ),
+    (
+        "replanning with a new plan returns to plan_ready",
+        make_state(St.REPLANNING, plan=_PLAN),
+        St.PLAN_READY,
+    ),
+    (
+        "plan ready with a recipe but no baseline runs the baseline",
+        make_state(St.PLAN_READY, env=recipe()),
+        St.BASELINE,
+    ),
+    (
+        "plan ready after a replan skips the already-recorded baseline",
+        make_state(St.PLAN_READY, env=recipe(), baseline=[make_test_run("t", True)]),
+        St.IMPLEMENTING,
+    ),
+    (
+        "bootstrap with a recipe proceeds to baseline",
+        make_state(St.ENV_BOOTSTRAP, env=recipe()),
+        St.BASELINE,
+    ),
+    (
+        "bootstrap with a recipe that has no commands escalates — nothing could verify",
+        make_state(St.ENV_BOOTSTRAP, env=recipe(commands={})),
+        St.ESCALATED,
+    ),
+    (
+        "baseline whose setup fails escalates — nothing after it is attributable",
+        make_state(St.BASELINE, baseline=[make_test_run("x", False, type_="setup", parsed=False)]),
+        St.ESCALATED,
+    ),
+    (
+        "implementing with a diff proceeds to testing",
+        make_state(St.IMPLEMENTING, diff=DiffSummary(files_changed=["a.py"])),
+        St.TESTING,
+    ),
+    (
+        "implementing that changed nothing escalates instead of looping",
+        make_state(St.IMPLEMENTING, diff=DiffSummary(files_changed=[])),
+        St.ESCALATED,
+    ),
+    (
+        "developer declaring the plan invalid replans",
+        make_state(St.IMPLEMENTING, implementation=implementation(plan_invalid=True)),
+        St.REPLANNING,
+    ),
+    (
+        "developer declaring the plan invalid with replans exhausted escalates",
+        make_state(
+            St.IMPLEMENTING, implementation=implementation(plan_invalid=True), replan_count=2
+        ),
+        St.ESCALATED,
+    ),
+    (
+        "testing with a new failure skips review and goes back to the developer",
+        make_state(St.TESTING, verification=[make_test_run("new_break", False)]),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "testing with only pre-existing failures proceeds to review",
+        make_state(
+            St.TESTING,
+            baseline=[make_test_run("already_broken", False, iteration=0)],
+            verification=[make_test_run("already_broken", False)],
+        ),
+        St.REVIEWING,
+    ),
+    (
+        "an unparseable failure where baseline passed counts as new",
+        make_state(
+            St.TESTING,
+            baseline=[make_test_run("x", True, iteration=0)],
+            verification=[make_test_run("x", False, parsed=False)],
+        ),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "a failure fixed in a later attempt no longer blocks",
+        make_state(
+            St.REVIEWING,
+            review=review(Verdict.APPROVED),
+            verification=[
+                make_test_run("was_broken", False, iteration=1),
+                make_test_run("was_broken", True, iteration=2),
+            ],
+        ),
+        St.READY_FOR_FINALIZE,
+    ),
+    (
+        "approved verdict with an unresolved P1 finding is overridden by severity",
+        make_state(St.REVIEWING, review=review(Verdict.APPROVED, [finding()])),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "approved verdict with only a P2 finding finalizes",
+        make_state(St.REVIEWING, review=review(Verdict.APPROVED, [finding(severity=Severity.P2)])),
+        St.READY_FOR_FINALIZE,
+    ),
+    (
+        "a reviewer plan-conformance finding replans",
+        make_state(
+            St.CHANGES_REQUIRED,
+            iteration=1,
+            review=review(Verdict.CHANGES_REQUESTED, [finding(FindingCategory.PLAN_CONFORMANCE)]),
+        ),
+        St.REPLANNING,
     ),
 ]
 

@@ -82,7 +82,7 @@ The things that must stay swappable, and what fills each slot over time:
 |---|---|---|
 | **Source** | local CLI + markdown file | GitHub App webhooks, Jira, Linear |
 | **Runtime** | `claude` CLI, `opencode` CLI | `codex exec`, in-process Agent SDK |
-| **Sandbox** | direct git on a task branch | Docker per task → E2B / Modal / k8s |
+| **Sandbox** | per-task clone, commands run on host | Docker per task → E2B / Modal / k8s |
 | **Sink** | local branch + diff | GitHub PR + checks |
 | **State** | SQLite checkpoints | Postgres + domain tables |
 | **Knowledge** | — | Postgres facts rendered into the sandbox |
@@ -108,7 +108,8 @@ Defined in `devloop.contracts`:
 | `RequirementResult` | Requirement agent | `decide()` (`status` field) |
 | `PlanResult` | Planner | Developer, Reviewer |
 | `EnvRecipe` | Bootstrap agent | Sandbox, cached per repo |
-| `DiffSummary` + `Deviation` | Developer | Reviewer (plan conformance) |
+| `ImplementationResult` (`Deviation`, `PlanInvalidation`, `FindingDispute`) | Developer | `decide()` (`plan_invalid`), Reviewer |
+| `DiffSummary` | **Orchestrator only** (git, after the Developer) | `decide()` (empty diff), Reviewer |
 | `TestRunResult` | **Orchestrator only** | `decide()` (baseline vs new failures) |
 | `ReviewResult` / `Finding` | Reviewer *and* humans | `decide()` (`verdict`, `severity`) |
 
