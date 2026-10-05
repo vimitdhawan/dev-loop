@@ -17,20 +17,20 @@ permissions. A pure `decide()` function is the only code that chooses the next
 step, and it reads only stored facts — never a model's opinion about what
 should happen next.
 
-> **Status: Phase 0.** The state machine, contracts, graph, human gates and
-> CLI are built and verified end to end — with **stub agents that make no
-> model calls**. Real agents and the Docker sandbox are Phase 1–2. See
-> [`docs/phases.md`](docs/phases.md).
+> **Status: Phase 2.** Real agents (`claude`, `opencode`) run every role
+> behind file-based contracts, with a per-task clone and real test runs.
+> The Docker sandbox (rest of Phase 1) is next — until then agents and the
+> repo's check commands run **on your machine**, so only point DevLoop at
+> repos you trust. See [`docs/phases.md`](docs/phases.md).
 
 ---
 
 ## Requirements
 
-- Python ≥ 3.12
-- [`uv`](https://docs.astral.sh/uv/)
-- git
-
-Nothing else for Phase 0 — no database server, no Docker, no API keys.
+- Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/), git
+- An agent CLI: [`claude`](https://docs.claude.com/en/docs/claude-code)
+  (default) or [`opencode`](https://opencode.ai) — or `--runtime stub` to
+  run the whole loop with no model and no cost
 
 ## Setup
 
@@ -41,135 +41,86 @@ uv sync
 ## Usage
 
 DevLoop works against a **target repository** — the repo it writes code in,
-which is not this repo. Point it at a scratch repo first.
+which is not this repo. It clones it to `~/.devloop/work/<task-id>`, so your
+checkout is never touched; the result appears as a `devloop/<task-id>`
+branch in your repo.
+
+### 1. Tell DevLoop how to check the repo
+
+Add a `devloop.yml` to the target repo (Go, `uv` Python and npm/pnpm/yarn
+repos are auto-detected without one):
+
+```yaml
+setup:                       # optional, runs before every check
+  - uv sync
+commands:                    # name -> command, all must pass (or fail as before)
+  lint: uv run ruff check .
+  unit: uv run pytest -q
+```
+
+### 2. Describe the task and run it
 
 ```bash
-# 1. a target repo with a clean working tree
-mkdir /tmp/demo && cd /tmp/demo && git init
-echo "# demo" > README.md && git add -A && git commit -m "initial"
-
-# 2. describe the task in markdown
-echo "Add a changelog note describing today's work." > /tmp/task.md
-
-# 3. run it
-cd /path/to/dev-loop
-uv run devloop run --repo /tmp/demo --task /tmp/task.md
+echo "Add a slugify(text) helper to textutil/words.py, with tests." > /tmp/add-slugify.md
+uv run devloop run --repo ~/code/textutil --task /tmp/add-slugify.md --model sonnet --budget-usd 3
 ```
 
 ```
-╭──────────────────────────────────────────────╮
-│ task 3e647a97: task                          │
-│ repo: /tmp/demo                              │
-╰──────────────────────────────────────────────╯
--> RECEIVED
--> PLANNING
--> PLAN_READY
--> ENV_BOOTSTRAP
--> BASELINE
--> IMPLEMENTING
--> TESTING
--> REVIEWING
--> READY_FOR_FINALIZE
-╭──────────── waiting on a human ──────────────╮
-│ paused — resume with:                        │
-│   devloop resume 3e647a97 --answer '...'     │
-╰──────────────────────────────────────────────╯
+-> RECEIVED  $0.0000
+-> PLANNING  $0.0540
+-> PLAN_READY  $0.1045
+-> ENV_BOOTSTRAP  $0.1045
+-> BASELINE  $0.1045
+-> IMPLEMENTING  $0.1045
+-> TESTING  $0.1748
+-> REVIEWING  $0.1748
+-> READY_FOR_FINALIZE  $0.2262
+╭──────────────── waiting on a human ─────────────────╮
+│ gate: finalize                                      │
+│ branch: devloop/c81908dc                            │
+│ inspect: git -C ~/code/textutil diff 792f810b41..devloop/c81908dc │
+│ review: { "verdict": "approved", ... }              │
+╰─────────────────────────────────────────────────────╯
 ```
 
-The run pauses at a human gate. Approve it — from a *separate* process, state
-is persisted:
+### 3. Inspect, then approve or cancel
 
 ```bash
-uv run devloop resume 3e647a97 --answer approve
-# -> READY_FOR_FINALIZE -> FINALIZED
+git -C ~/code/textutil diff main..devloop/c81908dc
+uv run devloop show c81908dc                      # cost + every agent run
+uv run devloop resume c81908dc --answer approve   # or --answer cancel
 ```
 
-Inspect what it did:
-
-```bash
-cd /tmp/demo
-git log --oneline devloop/3e647a97
-git diff main devloop/3e647a97
-```
+A task can also pause to ask a clarifying question (`--answer` with your
+reply) or escalate (budget, iteration/replan caps, an agent failure, a
+disputed finding) — `devloop show` prints the reason.
 
 ### Commands
 
 | Command | Purpose |
 |---|---|
 | `devloop run --repo <path> --task <file.md>` | Start a task |
+| `  --runtime claude\|opencode\|stub` | Agent CLI for every role (default `claude`) |
+| `  --model <name>` | Model passed to the CLI (`sonnet`, `opus`, …) |
+| `  --role-runtime reviewer=opencode` | Per-role override, repeatable |
+| `  --budget-usd <n>` | Escalate once spend reaches this (default 20) |
 | `devloop resume <task-id> --answer <text>` | Answer a human gate and continue |
+| `devloop show <task-id>` | Status, cost, escalation reason, agent runs |
 
-`devloop run` also accepts `--budget-usd` (default `20.0`) — the task
-escalates to a human rather than continuing once estimated cost reaches it.
+### Where things live
 
-### Configuration
+| Path | What |
+|---|---|
+| `~/.devloop/checkpoints.sqlite` | graph state (`DEVLOOP_DATABASE_URL` for Postgres) |
+| `~/.devloop/work/<task-id>/` | the task's clone; `.devloop/in` / `.devloop/out` hold agent I/O |
+| `~/.devloop/tasks/<task-id>/` | `agent_runs.jsonl`, raw CLI logs, check logs |
+| `prompts/<role>/v<N>.md` | versioned prompts (`DEVLOOP_PROMPT_<ROLE>=v<N>` pins one) |
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `DEVLOOP_DATABASE_URL` | unset | Postgres DSN for checkpoints. Unset → SQLite at `~/.devloop/checkpoints.sqlite` |
-
-State persists across CLI invocations by design: `run` and `resume` are
-separate processes, so an in-memory store would lose everything between them.
-
-### Safety notes
-
-- DevLoop **refuses to run against a repo with uncommitted changes**.
-- Each task gets its own `devloop/<task-id>` branch, always forked from the
-  repo's base branch — never from a previous task's branch.
-- Nothing is pushed. Phase 0 produces local branches only.
-
----
+`DEVLOOP_HOME` moves `~/.devloop`.
 
 ## Development
 
 ```bash
-uv run pytest          # 30 table-driven policy tests, ~20ms, no fixtures
-uv run ruff check src tests
-uv run mypy src
+uv run pytest            # no model calls, no network
+uv run ruff check . && uv run mypy src
 ```
-
-The routing tests are the highest-value tests in the repo: `decide()` is pure,
-so every transition and guard rejection is a table row. If they're green, the
-state machine cannot skip a gate regardless of what a model produces.
-
-## Layout
-
-```
-src/devloop/
-  contracts/     # Pydantic artifact contracts + status enum — the API surface
-  graph/
-    routing.py   # decide(): the pure orchestrator policy
-    build.py     # LangGraph wiring, status -> node routing
-    nodes/       # node implementations + Phase 0 stub agents
-  sandbox/       # git isolation now; Docker sandbox in Phase 1
-  cli/           # typer CLI: run, resume
-  runtimes/      # CodingAgent adapters (claude, opencode, codex) — Phase 2
-  env/           # environment discovery + bootstrap — Phase 1
-  knowledge/     # per-repo knowledge base — Phase 4
-  sources/       # local CLI now; GitHub App in v1
-  store/         # domain tables — Phase 5
-  telemetry/     # OTel -> LangSmith — Phase 5
-prompts/         # versioned per role; mutation target of the v2 engine
-docs/
-tests/
-```
-
-Empty packages are intentional — they mark the adapter seams described in the
-architecture doc, so each phase fills a slot rather than reshaping the tree.
-
-## Documentation
-
-- [`docs/architecture.md`](docs/architecture.md) — the North Star: two-plane
-  design, contracts, the five hard problems (broken test environments, plans
-  that die on contact, unwanted changes, staying local, the knowledge base)
-- [`docs/phases.md`](docs/phases.md) — what each phase contains, what Phase 0
-  actually built, and what "done" means for the phases ahead
-
-## Stack
-
-Python · LangGraph (durable checkpoints + human-in-the-loop interrupts) ·
-Pydantic (contracts) · Typer · SQLite/Postgres · LangSmith (traces, Phase 5).
-
-Agents run as **CLI subprocesses** (`claude`, `opencode`, later `codex`)
-inside a sandbox, behind one `CodingAgent` interface — so swapping which model
-implements and which reviews is a config change.

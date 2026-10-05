@@ -64,7 +64,7 @@ NODE_FUNCS = {
 }
 
 
-def build_graph(checkpointer: BaseCheckpointSaver[Any] | None = None) -> object:
+def build_graph(checkpointer: BaseCheckpointSaver[Any] | None = None) -> Any:
     """Compile the DevLoop graph. Pass a LangGraph checkpointer (e.g.
     `PostgresSaver` or `InMemorySaver`) to enable `interrupt()`/resume."""
 

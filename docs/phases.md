@@ -6,8 +6,8 @@ Architecture context lives in [`architecture.md`](./architecture.md).
 | Phase | Scope | Status |
 |---|---|---|
 | **0** | Walking skeleton — state machine, contracts, graph, local CLI | ✅ **Done** |
-| **1** | Sandbox + environment bootstrap | ⬜ Next |
-| **2** | Real agents (Reviewer → Planner → Requirement → Developer) | ⬜ |
+| **1** | Sandbox + environment bootstrap | 🟡 Partial — per-task clone, `devloop.yml`, host-run baseline; Docker ⬜ |
+| **2** | Real agents (Reviewer → Planner → Requirement → Developer) | ✅ **Done** |
 | **3** | Human loop (clarify Q&A, scoped feedback, escalation) | ⬜ |
 | **4** | Knowledge base | ⬜ |
 | **5** | Hardening + telemetry | ⬜ |
@@ -159,9 +159,21 @@ base, no domain tables (only LangGraph checkpoints), no telemetry.
 
 ---
 
-# Phase 1 — Sandbox + environment ⬜
+# Phase 1 — Sandbox + environment 🟡
 
 Where problem 1 ("the cloned repo can't run its tests") actually gets solved.
+
+**Built ahead of Phase 2** (the thin slice real agents needed):
+
+- Per-task clone at `~/.devloop/work/<task-id>` on `devloop/<task-id>`
+  (`sandbox/workspace.py`) — agents never touch the user's checkout. Same
+  `/workspace` layout the container will bind-mount.
+- Environment discovery: `devloop.yml` → lockfile heuristics (`go.mod`,
+  `uv.lock`, `package.json` + lockfile) in `env/discovery.py`.
+- **Baseline gate** wired to real command execution (`env/runner.py`),
+  run on the host. Setup failing at the base commit escalates.
+
+**Still to do:**
 
 - Base sandbox image: git + `claude` + `opencode` + language toolchains
 - Bare mirror at `~/.devloop/repos/<owner>/<repo>.git`, then
@@ -171,42 +183,186 @@ Where problem 1 ("the cloned repo can't run its tests") actually gets solved.
   bind-mounted at an identical path)*
 - Container lifecycle with `--memory`, `--cpus`, `--pids-limit`, read-only
   root + writable `/workspace`, egress limited to registry + model API
-- Streamed log capture to per-task artifacts
 - Service containers via a per-task compose project on an isolated network
-- Environment discovery: `devloop.yml` → `.devcontainer/` →
-  `.github/workflows/*.yml` → lockfile heuristics
+- `.devcontainer/` and `.github/workflows/*.yml` discovery
 - Bootstrap agent producing a validated `EnvRecipe`
-- **Baseline gate** wired to real command execution
 - Image + recipe caching keyed by repo + lockfile hash
 
 **Done when:** pointed at a repo with a deliberately broken test setup, it
 either produces a working recipe or escalates cleanly — and never proceeds on
 an unattributable baseline.
 
+> ⚠️ Until the container lands, agent CLIs and the repo's own
+> `devloop.yml` commands run **on the host**. Point DevLoop only at repos
+> you trust.
+
 ---
 
-# Phase 2 — Real agents ⬜
+# Phase 2 — Real agents ✅
 
-Order is deliberate: **Reviewer → Planner → Requirement → Developer.**
+**Goal:** replace every stub with a real agent CLI behind one interface,
+without changing the graph's shape or letting a model choose a transition.
 
-Reviewer first because it is pure input → JSON, so it builds the
-contract-validation and repair-retry harness with no repo mutation. Developer
-last because it is the only role that writes code.
+## Why agents came before Docker
 
-- `CodingAgent` interface + `claude` and `opencode` adapters
-  (`codex` stubbed — not installed locally, highest value later as the
-  cross-check reviewer)
-- File-based contract: agent writes `/workspace/.devloop/out/<role>.json`,
-  orchestrator validates with Pydantic, one repair retry on validation error
-- `DevelopmentContext` assembled by the orchestrator and passed as
-  `/workspace/.devloop/in/context.json`, never as a giant prompt string
-- Versioned prompts in `prompts/`, recorded per run
-- Deterministic plan check before implementing
-- Cost and token capture from each CLI's output into `agent_runs`
+The docs originally ordered Phase 1 (sandbox) before Phase 2 (agents). We
+swapped them: the hard, uncertain problems — contract validation, prompt
+quality, repair behaviour, cost — only show up with real models, while
+Docker isolation is well-understood plumbing. A per-task clone plus
+host-run checks gave the agents a real repo and real verification in a
+fraction of the time. The cost is that, until Phase 1 finishes, agent code
+runs on the operator's machine (trusted repos only).
 
-**Done when:** a small, well-specified task on a real repo produces a correct
-diff, and a second run where the Reviewer must request changes exercises the
-repair cycle and the iteration cap.
+## What was built
+
+### `CodingAgent` seam — `src/devloop/runtimes/`
+
+| File | Contents |
+|---|---|
+| `base.py` | `CodingAgent` protocol, `AgentInvocation`, `ToolPolicy`, `AgentOutcome` |
+| `claude_cli.py` | `claude -p --output-format json`; cost/tokens from the result JSON |
+| `opencode_cli.py` | `opencode run --format json`; cost summed from `step_finish` events |
+| `codex_cli.py` | registered, raises "not implemented" — the future cross-check reviewer |
+| `stub.py` | no-model runtime writing the same contract files; scriptable per role |
+| `registry.py` | name → runtime; `register_runtime()` for tests |
+
+Claude isolation, all deliberate: `--permission-mode dontAsk` with an
+explicit allowlist; read-only roles get `Edit(./.devloop/out/**)` only;
+`--setting-sources ""` + `--strict-mcp-config` so neither the target repo's
+`.claude/settings.json` hooks nor the operator's plugins load (runs are
+reproducible); `--max-budget-usd` = what's left of the task budget. The
+prompt goes via stdin.
+
+### The harness — `src/devloop/agents/harness.py`
+
+`run_role(spec, context, ...)`, identical for every runtime:
+
+1. writes `DevelopmentContext` to `.devloop/in/context.json`
+2. deletes any stale `.devloop/out/<role>.json`
+3. runs the CLI with the role's `ToolPolicy`
+4. validates the output with Pydantic, then the role's deterministic check
+5. **one** repair retry with the problems fed back, then escalate
+
+Crashes, timeouts and a read-only role dirtying the workspace are *not*
+retried (not format problems). Every attempt becomes an `AgentRunRecord`
+in state and in `~/.devloop/tasks/<id>/agent_runs.jsonl`; raw CLI output is
+kept under `logs/`.
+
+### Roles — `src/devloop/agents/roles.py`, prompts in `prompts/`
+
+| Role | Contract | Tools |
+|---|---|---|
+| Requirement | `RequirementResult` | read-only + write own output |
+| Planner | `PlanResult` (+ `FileToChange.action`) | read-only + write own output |
+| Developer | `ImplementationResult` (new) | edit + the repo's own commands |
+| Reviewer | `ReviewResult` | read-only; diff handed over as `.devloop/in/diff.patch` |
+
+Every role may run read-only shell (`git status|diff|log|show`, `ls`,
+`cat`, `head`, `tail`, `wc`, `grep`). The Developer may also run the
+recipe's setup/check commands. Nobody may commit, push or fetch — the
+orchestrator commits after the Developer and publishes the branch to the
+target repo.
+
+`ImplementationResult` carries what a diff can't: `deviations`,
+`plan_invalid` (→ REPLANNING with evidence), `disputed_findings` (a
+finding the Developer declined, e.g. it contradicts the requirements) and
+`notes_for_reviewer`.
+
+Prompts are `prompts/<role>/v<N>.md` + a shared `prompts/_contract.md`.
+The recorded version is `v<N>+<sha8>` of the exact text, so an unbumped
+edit still shows as a different version in `agent_runs`.
+
+### Deterministic checks — `src/devloop/agents/checks.py`
+
+No model, no cost, fed into the repair retry like schema errors:
+
+- **plan**: paths relative and inside the repo, not under `.git`/`.devloop`;
+  `modify`/`delete` targets exist, `create` targets don't; ≤ 25 files; no
+  duplicates; at least one step
+- **requirements**: `needs_clarification` has questions; `ready` has criteria
+- **review**: unique finding ids; `changes_requested` has findings
+- **implementation**: disputed finding ids exist
+
+### Policy changes — `decide()`
+
+| Rule | Why |
+|---|---|
+| `escalation_reason` set → `ESCALATED` (in-flight only) | failed side effects route through the policy, not around it |
+| `RECEIVED` → `PLANNING` only when requirements are `ready` | previously any requirements skipped clarification |
+| `ENV_BOOTSTRAP` with no commands → `ESCALATED` | nothing could verify the change |
+| `BASELINE` with failing setup → `ESCALATED` | nothing after it is attributable |
+| `PLAN_READY` with a baseline → `IMPLEMENTING` | a replan doesn't re-run baseline |
+| `IMPLEMENTING` + `plan_invalid` → `REPLANNING` (capped) | Developer-declared invalid plans |
+| `IMPLEMENTING` with an empty diff → `ESCALATED` | no infinite loop on a no-op Developer |
+| `TESTING` with new failures → `CHANGES_REQUIRED` | don't pay a Reviewer to read red code |
+| `REVIEWING`: `approved` + unresolved P0/P1 → `CHANGES_REQUIRED` | severity beats a contradictory verdict |
+| Regression gate compares only the **latest** attempt | a failure fixed in iteration 2 stops counting |
+| Unparsed failures key on the command | a compile error is a failure even with no test names |
+
+`iteration` now increments in `implement` (attempts), so the cap still
+holds when red checks skip review.
+
+### CLI
+
+```
+devloop run --repo <path> --task <file.md> [--runtime claude|opencode|stub]
+            [--model sonnet] [--role-runtime reviewer=opencode] [--budget-usd 20]
+devloop resume <task-id> --answer <text|approve|cancel>
+devloop show <task-id>        # status, cost, every agent run
+```
+
+Interrupt payloads (questions, review, escalation reason, how to inspect the
+branch) are printed at every gate.
+
+## Bugs fixed on the way
+
+Found in Phase-0 code while wiring real agents:
+
+1. **Repair wiped the previous attempt.** `implement` re-created the task
+   branch with `branch -D` every iteration.
+2. **Reviewer `plan_conformance` findings could never trigger a replan** —
+   `decide()` only looked at human `feedback`.
+3. **Regression gate missed build breaks** (failures with no parsed test
+   names) and **counted already-fixed failures forever** (it unioned every
+   iteration's verification).
+4. **`finalize` could never cancel** — it compared the resume payload
+   `{"answer": "cancel"}` to the string `"cancel"`.
+5. `cost_usd` was never incremented, so the budget guard was dead.
+
+Found by running real models:
+
+6. A bare `Edit` allow rule does **not** cover Claude's `Write` tool (a
+   path-scoped `Edit(...)` rule does). The Developer couldn't create its
+   output file; it now gets both.
+7. The Developer piped test output through `tail` and was denied; the
+   read-only utility allowlist and an explicit "your tools" prompt section
+   fixed it.
+8. Given a review finding that contradicted the requirements, the Developer
+   correctly refused — but had no way to say so except prose, so the
+   escalation read "made no changes". Hence `disputed_findings`.
+9. `devloop.yml` with `unit: true` failed validation (YAML bool).
+
+## Verified
+
+- 118 tests: routing table (50 cases), harness (repair, give-up, crash,
+  read-only violation, stale output), plan checks, adapters' argv/parsing,
+  workspace, env, prompts, and end-to-end graph runs with the stub runtime
+  (happy path, repair cycle, iteration cap, red checks skip review, replan,
+  clarification, dispute, missing recipe, invalid output, resume in a fresh
+  process). `ruff` + `mypy --strict` clean.
+- **Real run** (`claude`, Sonnet) on a small Python repo, "add `slugify`
+  with tests": correct 2-file diff, 9/9 tests green, **$0.23**, ~70s.
+- **Real repair cycle**: real Requirement/Planner/Developer, scripted
+  Reviewer rejecting once with a P1 testing finding → iteration 2 was a
+  3-line commit adding exactly that test → approved. **$0.25** total.
+
+## Known gaps → later phases
+
+- Crash-resume of an agent node re-runs the agent (double spend) — Phase 5.
+- Human feedback findings are never marked resolved — Phase 3 (`devloop feedback`).
+- `escalate` can only `cancel`; retry-from-here is Phase 3.
+- The Reviewer occasionally cites line numbers beyond the file's length;
+  a cheap deterministic check is a candidate addition.
 
 ---
 

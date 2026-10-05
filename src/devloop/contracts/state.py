@@ -17,11 +17,13 @@ from devloop.contracts.artifacts import (
     Deviation,
     EnvRecipe,
     Finding,
+    ImplementationResult,
     PlanResult,
     RequirementResult,
     ReviewResult,
     TestRunResult,
 )
+from devloop.contracts.runs import AgentRunRecord, RuntimeConfig
 from devloop.contracts.status import DevLoopStatus
 
 BUDGET_USD_DEFAULT = 20.0
@@ -50,11 +52,20 @@ class DiffSummary(BaseModel):
 class DevLoopState(TypedDict, total=False):
     task: TaskInput
     status: DevLoopStatus
+    runtime: RuntimeConfig
+
+    # Per-task workspace (a clone of the target repo) and where it forked.
+    workspace_path: str | None
+    base_commit: str | None
+    branch: str | None
 
     requirements: RequirementResult | None
     plan: PlanResult | None
+    # Why the last plan was abandoned; handed to the Planner on a replan.
+    replan_reason: str | None
     env: EnvRecipe | None
     baseline: Annotated[list[TestRunResult], operator.add]
+    implementation: ImplementationResult | None
     diff: DiffSummary | None
     verification: Annotated[list[TestRunResult], operator.add]
     review: ReviewResult | None
@@ -64,5 +75,9 @@ class DevLoopState(TypedDict, total=False):
     replan_count: int
     cost_usd: float
     budget_usd: float
+    agent_runs: Annotated[list[AgentRunRecord], operator.add]
+    # Set by a node when a side effect failed in a way only a human can fix
+    # (agent CLI crashed, contract invalid after repair, git refused).
+    escalation_reason: str | None
 
     knowledge_used: list[str]
