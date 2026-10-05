@@ -17,12 +17,14 @@ from collections.abc import Iterable
 from devloop.contracts.artifacts import (
     Finding,
     FindingCategory,
+    QAVerdict,
     RequirementStatus,
     Severity,
     TestRunResult,
     Verdict,
 )
 from devloop.contracts.state import (
+    MAX_PO_CONSULTATIONS,
     MAX_REPLANS,
     MAX_REVIEW_ITERATIONS,
     DevLoopState,
@@ -50,12 +52,24 @@ def decide(state: DevLoopState) -> St:
 
     match status:
         case St.RECEIVED | St.CLARIFICATION_REQUIRED:
+            if state.get("pending_questions"):
+                return St.CLARIFICATION_REQUIRED
             req = state.get("requirements")
             if req is not None and req.status == RequirementStatus.READY:
-                return St.PLANNING
+                # a human answering an Engineer's question returns to the
+                # step that asked; the initial clarification goes to planning
+                return state.get("consult_return") or St.PLANNING
             return St.CLARIFICATION_REQUIRED
 
+        case St.CONSULTING_PO:
+            if state.get("pending_questions"):
+                # the Product Owner couldn't answer everything
+                return St.CLARIFICATION_REQUIRED
+            return state.get("consult_return") or St.ESCALATED
+
         case St.PLANNING | St.REPLANNING:
+            if state.get("pending_questions"):
+                return _consult(state)
             return St.PLAN_READY if state.get("plan") else status
 
         case St.PLAN_READY:
@@ -80,6 +94,8 @@ def decide(state: DevLoopState) -> St:
             return St.IMPLEMENTING
 
         case St.IMPLEMENTING:
+            if state.get("pending_questions"):
+                return _consult(state)
             impl = state.get("implementation")
             if impl is not None and impl.plan_invalid is not None:
                 if state.get("replan_count", 0) < MAX_REPLANS:
@@ -88,14 +104,24 @@ def decide(state: DevLoopState) -> St:
             diff = state.get("diff")
             if diff is None:
                 return St.IMPLEMENTING
-            # The Developer ran and changed nothing without declaring the
+            # The Engineer ran and changed nothing without declaring the
             # plan invalid — looping would just burn budget.
             return St.TESTING if diff.files_changed else St.ESCALATED
 
         case St.TESTING:
-            # Red checks go straight back to the Developer: reviewing a
-            # change that already fails verification is wasted spend.
-            return St.CHANGES_REQUIRED if new_failure_keys(state) else St.REVIEWING
+            # Red checks go straight back to the Engineer: browser-testing
+            # or reviewing a change that already fails is wasted spend.
+            return St.CHANGES_REQUIRED if new_failure_keys(state) else St.QA_TESTING
+
+        case St.QA_TESTING:
+            qa = state.get("qa")
+            if qa is None:
+                return St.QA_TESTING
+            if qa.verdict == QAVerdict.BLOCKED:
+                return St.ESCALATED
+            if qa.verdict == QAVerdict.FAILED or _blocking(qa.findings):
+                return St.CHANGES_REQUIRED
+            return St.REVIEWING
 
         case St.REVIEWING:
             review = state.get("review")
@@ -105,8 +131,9 @@ def decide(state: DevLoopState) -> St:
                 review.verdict == Verdict.APPROVED
                 and not new_failure_keys(state)
                 and not _blocking(review.findings)
+                and _qa_ok(state)
             ):
-                return St.READY_FOR_FINALIZE
+                return St.PUBLISHING
             return St.CHANGES_REQUIRED
 
         case St.CHANGES_REQUIRED:
@@ -118,6 +145,9 @@ def decide(state: DevLoopState) -> St:
                 return St.IMPLEMENTING
             return St.ESCALATED
 
+        case St.PUBLISHING:
+            return St.READY_FOR_FINALIZE
+
         case St.READY_FOR_FINALIZE:
             # Waits for an explicit human decision (approve/cancel); a
             # bare re-decide() with no new input is idempotent.
@@ -127,6 +157,23 @@ def decide(state: DevLoopState) -> St:
             return status
 
     raise ValueError(f"decide(): no rule for status {status!r}")
+
+
+def _consult(state: DevLoopState) -> St:
+    """The Engineer asked a question. The Product Owner answers it — within
+    a cap, so two agents can't ping-pong a task's budget away."""
+
+    if state.get("po_consultations", 0) < MAX_PO_CONSULTATIONS:
+        return St.CONSULTING_PO
+    return St.ESCALATED
+
+
+def _qa_ok(state: DevLoopState) -> bool:
+    """The Reviewer has the final say, but only on a change QA passed (or
+    that has no app to test)."""
+
+    qa = state.get("qa")
+    return qa is not None and qa.verdict in (QAVerdict.PASSED, QAVerdict.SKIPPED)
 
 
 _BLOCKING = {Severity.P0, Severity.P1}
@@ -140,12 +187,18 @@ def _blocking(findings: Iterable[Finding]) -> bool:
 
 
 def open_findings(state: DevLoopState) -> list[Finding]:
-    """Unresolved findings from the latest review plus human feedback —
-    the one list the repair path works from, whatever its source."""
+    """Unresolved findings from the latest QA run, the latest review and
+    human feedback — the one list the repair path works from, whatever its
+    source."""
 
+    qa = state.get("qa")
     review = state.get("review")
-    reviewer = review.findings if review is not None else []
-    return [f for f in [*reviewer, *state.get("feedback", [])] if not f.resolved]
+    found = [
+        *(qa.findings if qa is not None else []),
+        *(review.findings if review is not None else []),
+        *state.get("feedback", []),
+    ]
+    return [f for f in found if not f.resolved]
 
 
 def failure_keys(run: TestRunResult) -> set[str]:

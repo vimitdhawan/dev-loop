@@ -12,8 +12,10 @@ from `step_finish` events.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
+import subprocess
 
 from devloop.runtimes.base import AgentInvocation, AgentOutcome, run_process
 
@@ -26,6 +28,8 @@ class OpenCodeCLIAgent:
 
     def build_argv(self, inv: AgentInvocation) -> list[str]:
         argv = [self.binary, "run", "--format", "json", "--dir", str(inv.workdir)]
+        if inv.resume_session:
+            argv += ["--session", inv.resume_session]
         if inv.model:
             argv += ["--model", inv.model]
         return argv
@@ -33,9 +37,35 @@ class OpenCodeCLIAgent:
     def permission_config(self, inv: AgentInvocation) -> dict[str, object]:
         bash: dict[str, str] = {"*": "deny"}
         bash.update({f"{prefix}*": "allow" for prefix in inv.tools.bash_allow})
-        return {
+        config: dict[str, object] = {
             "permission": {"edit": "allow", "bash": bash, "webfetch": "deny"},
         }
+        if inv.tools.mcp_servers:
+            config["mcp"] = {
+                s.name: {"type": "local", "command": list(s.command), "enabled": True}
+                for s in inv.tools.mcp_servers
+            }
+        return config
+
+    def check_model(self, model: str) -> str | None:
+        """None if opencode knows `model`, else what's wrong. opencode wants
+        `provider/model`; given `meta/x` for `nvidia/meta/x` it reads `meta`
+        as the provider and fails mid-run with an opaque server error."""
+
+        try:
+            proc = subprocess.run(
+                [self.binary, "models"], capture_output=True, text=True, timeout=120
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            return f"could not list opencode models: {exc}"
+        known = [line.strip() for line in proc.stdout.splitlines() if "/" in line]
+        if model in known:
+            return None
+        hints = [m for m in known if m.endswith("/" + model)] or difflib.get_close_matches(
+            model, known, n=3
+        )
+        hint = f" — did you mean {', '.join(hints)}?" if hints else ""
+        return f"opencode has no model {model!r} (ids are provider/model){hint}"
 
     def run(self, invocation: AgentInvocation) -> AgentOutcome:
         env = {

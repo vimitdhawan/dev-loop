@@ -5,8 +5,8 @@ from pathlib import Path
 
 from devloop.agents import roles
 from devloop.contracts.artifacts import EnvRecipe
-from devloop.contracts.runs import Role
-from devloop.runtimes.base import AgentInvocation, ToolPolicy
+from devloop.contracts.runs import Role, Step
+from devloop.runtimes.base import AgentInvocation, McpServer, ToolPolicy
 from devloop.runtimes.claude_cli import ClaudeCLIAgent, parse_result
 from devloop.runtimes.opencode_cli import OpenCodeCLIAgent, parse_events
 
@@ -14,6 +14,7 @@ from devloop.runtimes.opencode_cli import OpenCodeCLIAgent, parse_events
 def invocation(tools: ToolPolicy, **kw: object) -> AgentInvocation:
     return AgentInvocation(
         role=Role.REVIEWER,
+        step=Step.REVIEW,
         prompt="p",
         workdir=Path("/ws"),
         tools=tools,
@@ -24,7 +25,7 @@ def invocation(tools: ToolPolicy, **kw: object) -> AgentInvocation:
 
 def test_claude_read_only_role_can_only_write_its_output() -> None:
     argv = ClaudeCLIAgent("claude").build_argv(
-        invocation(roles.REVIEWER.tools, model="sonnet", max_budget_usd=1.234)
+        invocation(roles.REVIEW.tools, model="sonnet", max_budget_usd=1.234)
     )
 
     allowed = argv[argv.index("--allowedTools") + 1 :]
@@ -42,7 +43,7 @@ def test_claude_developer_can_edit_and_run_repo_commands() -> None:
     env = EnvRecipe(
         image="host", setup=["uv sync"], commands={"unit": "uv run pytest"}, verified_at_commit="x"
     )
-    argv = ClaudeCLIAgent("claude").build_argv(invocation(roles.developer(env).tools))
+    argv = ClaudeCLIAgent("claude").build_argv(invocation(roles.implement(env).tools))
 
     allowed = argv[argv.index("--allowedTools") + 1 :]
     assert "Edit" in allowed and "Write" in allowed
@@ -137,3 +138,40 @@ def test_run_process_reports_missing_binary(tmp_path: Path) -> None:
         ["devloop-no-such-cli"], stdin="", cwd=tmp_path, timeout_s=5, log_path=tmp_path / "x.log"
     )
     assert code == -1 and "command not found" in err
+
+
+def test_claude_resume_and_mcp(tmp_path: Path) -> None:
+    inv = AgentInvocation(
+        role=Role.QA,
+        step=Step.QA,
+        prompt="p",
+        workdir=tmp_path,
+        tools=roles.qa(str(tmp_path / "shots")).tools,
+        log_path=tmp_path / "logs" / "qa.log",
+        resume_session="sess-1",
+    )
+    argv = ClaudeCLIAgent("claude").build_argv(inv)
+
+    assert argv[argv.index("--resume") + 1] == "sess-1"
+    assert "--no-session-persistence" not in argv
+    assert "mcp__playwright" in argv[argv.index("--allowedTools") + 1 :]
+    config = json.loads(Path(argv[argv.index("--mcp-config") + 1]).read_text())
+    server = config["mcpServers"]["playwright"]
+    assert server["command"] == "npx" and "--headless" in server["args"]
+    assert str(tmp_path / "shots") in server["args"]
+
+
+def test_opencode_resume_and_mcp(tmp_path: Path) -> None:
+    inv = invocation(
+        ToolPolicy(mcp_servers=(McpServer("playwright", ("npx", "pw")),)),
+        resume_session="ses_1",
+    )
+    agent = OpenCodeCLIAgent("opencode")
+
+    argv = agent.build_argv(inv)
+    config = agent.permission_config(inv)
+
+    assert argv[argv.index("--session") + 1] == "ses_1"
+    assert config["mcp"] == {
+        "playwright": {"type": "local", "command": ["npx", "pw"], "enabled": True}
+    }

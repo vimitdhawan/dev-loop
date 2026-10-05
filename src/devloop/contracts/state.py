@@ -14,21 +14,24 @@ from typing import Annotated, TypedDict
 from pydantic import BaseModel
 
 from devloop.contracts.artifacts import (
+    Clarification,
     Deviation,
     EnvRecipe,
     Finding,
     ImplementationResult,
     PlanResult,
+    QAResult,
     RequirementResult,
     ReviewResult,
     TestRunResult,
 )
-from devloop.contracts.runs import AgentRunRecord, RuntimeConfig
+from devloop.contracts.runs import AgentRunRecord, PullRequestConfig, TeamConfig
 from devloop.contracts.status import DevLoopStatus
 
 BUDGET_USD_DEFAULT = 20.0
 MAX_REVIEW_ITERATIONS = 3
 MAX_REPLANS = 2
+MAX_PO_CONSULTATIONS = 3
 
 
 class TaskInput(BaseModel):
@@ -37,7 +40,11 @@ class TaskInput(BaseModel):
 
     external_id: str
     source: str = "local"
-    repo_path: str
+    # A local path or a clone URL. Either way the task works in a fresh
+    # clone; the user's checkout is never touched.
+    repo: str
+    # Branch to fork from; None = the repo's default branch.
+    base_branch: str | None = None
     title: str
     description: str
 
@@ -52,24 +59,42 @@ class DiffSummary(BaseModel):
 class DevLoopState(TypedDict, total=False):
     task: TaskInput
     status: DevLoopStatus
-    runtime: RuntimeConfig
+    team: TeamConfig
+    pull_request: PullRequestConfig
 
     # Per-task workspace (a clone of the target repo) and where it forked.
     workspace_path: str | None
+    base_branch: str | None
     base_commit: str | None
     branch: str | None
+    # role -> agent session id, so the Product Owner, Engineer and QA each
+    # keep their context across steps. The Reviewer is never stored here:
+    # every review starts fresh.
+    sessions: dict[str, str]
 
     requirements: RequirementResult | None
+    # Questions the Engineer is waiting on, the status to return to once
+    # they're answered, and every answer so far (PO's or a human's).
+    pending_questions: list[str]
+    consult_return: DevLoopStatus | None
+    po_consultations: int
+    clarifications: Annotated[list[Clarification], operator.add]
+
     plan: PlanResult | None
-    # Why the last plan was abandoned; handed to the Planner on a replan.
+    # Why the last plan was abandoned; handed to the Engineer on a replan.
     replan_reason: str | None
     env: EnvRecipe | None
     baseline: Annotated[list[TestRunResult], operator.add]
     implementation: ImplementationResult | None
     diff: DiffSummary | None
     verification: Annotated[list[TestRunResult], operator.add]
+    qa: QAResult | None
     review: ReviewResult | None
+    # The findings the latest implementation attempt was asked to fix, so
+    # QA and a fresh Reviewer can check they actually were.
+    prior_findings: list[Finding]
     feedback: Annotated[list[Finding], operator.add]
+    pull_request_url: str | None
 
     iteration: int
     replan_count: int

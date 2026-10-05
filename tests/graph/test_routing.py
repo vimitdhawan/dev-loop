@@ -20,6 +20,9 @@ from devloop.contracts.artifacts import (
     ImplementationResult,
     PlanInvalidation,
     PlanResult,
+    QAResult,
+    QAScenario,
+    QAVerdict,
     RequirementResult,
     RequirementStatus,
     ReviewResult,
@@ -43,9 +46,17 @@ def make_state(status: St, **overrides: Any) -> DevLoopState:
         "baseline": [],
         "verification": [],
         "feedback": [],
+        "qa": QA_PASSED,
     }
     base.update(overrides)
     return base
+
+
+QA_PASSED = QAResult(verdict=QAVerdict.PASSED, scenarios=[QAScenario(criterion="c", passed=True)])
+
+
+def qa(verdict: QAVerdict, findings: list[Finding] | None = None) -> QAResult:
+    return QAResult(verdict=verdict, findings=findings or [])
 
 
 def req(status: RequirementStatus) -> RequirementResult:
@@ -162,14 +173,14 @@ CASES: list[tuple[str, DevLoopState, St]] = [
         St.IMPLEMENTING,
     ),
     (
-        "testing with no failures proceeds to reviewing",
+        "testing with no failures proceeds to QA",
         make_state(St.TESTING, verification=[make_test_run("t", True)]),
-        St.REVIEWING,
+        St.QA_TESTING,
     ),
     (
-        "review approved with no new failures finalizes",
+        "review approved with no new failures publishes",
         make_state(St.REVIEWING, review=review(Verdict.APPROVED)),
-        St.READY_FOR_FINALIZE,
+        St.PUBLISHING,
     ),
     (
         "review approved but a NEW failure appeared blocks finalize",
@@ -185,14 +196,14 @@ CASES: list[tuple[str, DevLoopState, St]] = [
         St.CHANGES_REQUIRED,
     ),
     (
-        "review approved with only pre-existing failures still finalizes",
+        "review approved with only pre-existing failures still publishes",
         make_state(
             St.REVIEWING,
             review=review(Verdict.APPROVED),
             baseline=[make_test_run("already_broken", False)],
             verification=[make_test_run("already_broken", False)],
         ),
-        St.READY_FOR_FINALIZE,
+        St.PUBLISHING,
     ),
     (
         "review changes_requested loops back",
@@ -382,13 +393,13 @@ CASES: list[tuple[str, DevLoopState, St]] = [
         St.CHANGES_REQUIRED,
     ),
     (
-        "testing with only pre-existing failures proceeds to review",
+        "testing with only pre-existing failures proceeds to QA",
         make_state(
             St.TESTING,
             baseline=[make_test_run("already_broken", False, iteration=0)],
             verification=[make_test_run("already_broken", False)],
         ),
-        St.REVIEWING,
+        St.QA_TESTING,
     ),
     (
         "an unparseable failure where baseline passed counts as new",
@@ -409,7 +420,7 @@ CASES: list[tuple[str, DevLoopState, St]] = [
                 make_test_run("was_broken", True, iteration=2),
             ],
         ),
-        St.READY_FOR_FINALIZE,
+        St.PUBLISHING,
     ),
     (
         "approved verdict with an unresolved P1 finding is overridden by severity",
@@ -417,9 +428,9 @@ CASES: list[tuple[str, DevLoopState, St]] = [
         St.CHANGES_REQUIRED,
     ),
     (
-        "approved verdict with only a P2 finding finalizes",
+        "approved verdict with only a P2 finding publishes",
         make_state(St.REVIEWING, review=review(Verdict.APPROVED, [finding(severity=Severity.P2)])),
-        St.READY_FOR_FINALIZE,
+        St.PUBLISHING,
     ),
     (
         "a reviewer plan-conformance finding replans",
@@ -429,6 +440,99 @@ CASES: list[tuple[str, DevLoopState, St]] = [
             review=review(Verdict.CHANGES_REQUESTED, [finding(FindingCategory.PLAN_CONFORMANCE)]),
         ),
         St.REPLANNING,
+    ),
+    # --- Phase 3: the team ----------------------------------------------
+    (
+        "engineer question while planning goes to the product owner",
+        make_state(St.PLANNING, pending_questions=["JSON or YAML?"]),
+        St.CONSULTING_PO,
+    ),
+    (
+        "engineer question while implementing goes to the product owner",
+        make_state(St.IMPLEMENTING, pending_questions=["q"]),
+        St.CONSULTING_PO,
+    ),
+    (
+        "engineer questions past the consultation cap escalate",
+        make_state(St.PLANNING, pending_questions=["q"], po_consultations=3),
+        St.ESCALATED,
+    ),
+    (
+        "product owner answered everything: back to the step that asked",
+        make_state(St.CONSULTING_PO, consult_return=St.IMPLEMENTING),
+        St.IMPLEMENTING,
+    ),
+    (
+        "product owner deferred a question: a human answers it",
+        make_state(St.CONSULTING_PO, pending_questions=["q"], consult_return=St.PLANNING),
+        St.CLARIFICATION_REQUIRED,
+    ),
+    (
+        "clarification waits while an engineer question is still open",
+        make_state(
+            St.CLARIFICATION_REQUIRED,
+            requirements=req(RequirementStatus.READY),
+            pending_questions=["q"],
+        ),
+        St.CLARIFICATION_REQUIRED,
+    ),
+    (
+        "a human answer to an engineer question returns to that step",
+        make_state(
+            St.CLARIFICATION_REQUIRED,
+            requirements=req(RequirementStatus.READY),
+            consult_return=St.REPLANNING,
+        ),
+        St.REPLANNING,
+    ),
+    (
+        "QA in progress stays put",
+        make_state(St.QA_TESTING, qa=None),
+        St.QA_TESTING,
+    ),
+    (
+        "QA passed goes to the reviewer",
+        make_state(St.QA_TESTING),
+        St.REVIEWING,
+    ),
+    (
+        "QA skipped (no app) goes to the reviewer",
+        make_state(St.QA_TESTING, qa=qa(QAVerdict.SKIPPED)),
+        St.REVIEWING,
+    ),
+    (
+        "QA failed goes back to the engineer",
+        make_state(St.QA_TESTING, qa=qa(QAVerdict.FAILED, [finding(FindingCategory.FUNCTIONAL)])),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "QA 'passed' with a P1 bug is overridden by severity",
+        make_state(St.QA_TESTING, qa=qa(QAVerdict.PASSED, [finding(FindingCategory.FUNCTIONAL)])),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "QA blocked escalates",
+        make_state(St.QA_TESTING, qa=qa(QAVerdict.BLOCKED)),
+        St.ESCALATED,
+    ),
+    (
+        "reviewer approval without a QA pass cannot publish",
+        make_state(St.REVIEWING, review=review(Verdict.APPROVED), qa=qa(QAVerdict.FAILED)),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "QA findings are part of the repair list",
+        make_state(
+            St.CHANGES_REQUIRED,
+            iteration=1,
+            qa=qa(QAVerdict.FAILED, [finding(FindingCategory.PLAN_CONFORMANCE)]),
+        ),
+        St.REPLANNING,
+    ),
+    (
+        "publishing goes to the human gate",
+        make_state(St.PUBLISHING),
+        St.READY_FOR_FINALIZE,
     ),
 ]
 
@@ -446,4 +550,4 @@ def test_decide_is_pure_and_idempotent() -> None:
     state = make_state(St.REVIEWING, review=review(Verdict.APPROVED))
     first = decide(state)
     second = decide(state)
-    assert first == second == St.READY_FOR_FINALIZE
+    assert first == second == St.PUBLISHING

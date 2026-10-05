@@ -56,6 +56,24 @@ class PlanResult(BaseModel):
     implementation_steps: list[str] = Field(default_factory=list)
     tests: list[TestPlanItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
+    # Non-empty: the Engineer can't plan without answers. The rest of the
+    # document is ignored and the questions go to the Product Owner.
+    questions_for_po: list[str] = Field(default_factory=list)
+
+
+class Clarification(BaseModel):
+    question: str
+    answer: str
+    answered_by: str  # "product_owner" | "human"
+
+
+class POAnswer(BaseModel):
+    """The Product Owner answering the Engineer. A question it can't answer
+    from the requirements and the code goes to a human instead of being
+    guessed at."""
+
+    answers: list[Clarification] = Field(default_factory=list)
+    needs_human: list[str] = Field(default_factory=list)
 
 
 class Severity(StrEnum):
@@ -71,6 +89,7 @@ class FindingCategory(StrEnum):
     PERFORMANCE = "performance"
     ARCHITECTURE = "architecture"
     TESTING = "testing"
+    FUNCTIONAL = "functional"  # QA: the feature doesn't behave as required
     MAINTAINABILITY = "maintainability"
     PLAN_CONFORMANCE = "plan_conformance"
 
@@ -83,9 +102,9 @@ class Finding(BaseModel):
     line: int | None = None
     description: str
     recommendation: str
-    # set when this finding originated from a human (terminal in v0, PR
-    # review comment in v1) rather than the Reviewer agent, and when it has
-    # been resolved so a later repair pass doesn't re-open it.
+    # who raised it — "reviewer", "qa", "orchestrator" or "human" — and
+    # whether it has been resolved so a later repair pass doesn't re-open it.
+    # One contract for every source means one repair path.
     source: str = "reviewer"
     resolved: bool = False
 
@@ -98,6 +117,32 @@ class Verdict(StrEnum):
 class ReviewResult(BaseModel):
     verdict: Verdict
     findings: list[Finding] = Field(default_factory=list)
+
+
+class QAVerdict(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    # QA couldn't test for a reason the Engineer can't fix (credentials,
+    # external service down). Escalates.
+    BLOCKED = "blocked"
+    # Set by the orchestrator, never by the agent: the repo has no `app:`.
+    SKIPPED = "skipped"
+
+
+class QAScenario(BaseModel):
+    criterion: str  # the acceptance criterion this scenario exercises
+    steps: list[str] = Field(default_factory=list)
+    passed: bool
+    evidence: str = ""  # what was observed; screenshot path under .devloop/qa/
+
+
+class QAResult(BaseModel):
+    verdict: QAVerdict
+    scenarios: list[QAScenario] = Field(default_factory=list)
+    # Bugs, as findings, so they go down the same repair path as review
+    # findings. Use ids Q1, Q2, …
+    findings: list[Finding] = Field(default_factory=list)
+    notes: str = ""
 
 
 class Deviation(BaseModel):
@@ -135,6 +180,9 @@ class ImplementationResult(BaseModel):
     plan_invalid: PlanInvalidation | None = None
     disputed_findings: list[FindingDispute] = Field(default_factory=list)
     notes_for_reviewer: str = ""
+    # Non-empty: the Engineer stopped to ask. Nothing is committed; the
+    # questions go to the Product Owner and the same session resumes.
+    questions_for_po: list[str] = Field(default_factory=list)
 
 
 class ServiceSpec(BaseModel):
@@ -142,6 +190,19 @@ class ServiceSpec(BaseModel):
     image: str
     env: dict[str, str] = Field(default_factory=dict)
     ports: list[int] = Field(default_factory=list)
+
+
+class AppSpec(BaseModel):
+    """How to run the app so QA can test it in a browser. Started and
+    stopped by the orchestrator, never by the agent."""
+
+    start: str
+    url: str
+    ready_timeout_s: int = 120
+    env: dict[str, str] = Field(default_factory=dict)
+    # run before `start` / after the app is stopped, e.g. `supabase start`
+    setup: list[str] = Field(default_factory=list)
+    teardown: list[str] = Field(default_factory=list)
 
 
 class EnvRecipe(BaseModel):
@@ -155,6 +216,7 @@ class EnvRecipe(BaseModel):
     services: list[ServiceSpec] = Field(default_factory=list)
     required_secrets: list[str] = Field(default_factory=list)
     verified_at_commit: str
+    app: AppSpec | None = None
 
 
 class TestFailure(BaseModel):

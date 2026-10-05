@@ -10,9 +10,9 @@ from pathlib import Path
 import pytest
 
 from devloop.agents import roles
-from devloop.agents.harness import run_role
+from devloop.agents.harness import run_step
 from devloop.contracts.context import DevelopmentContext
-from devloop.contracts.runs import Role
+from devloop.contracts.runs import AgentConfig, Role, Step
 from devloop.contracts.state import TaskInput
 from devloop.errors import AgentError
 from devloop.runtimes.base import OUT_DIR, AgentInvocation, AgentOutcome
@@ -31,18 +31,22 @@ class ScriptedAgent:
         self.actions = actions
         self.prompts: list[str] = []
         self.budgets: list[float | None] = []
+        self.resumed: list[str | None] = []
 
     def run(self, invocation: AgentInvocation) -> AgentOutcome:
         self.prompts.append(invocation.prompt)
         self.budgets.append(invocation.max_budget_usd)
+        self.resumed.append(invocation.resume_session)
         return self.actions.pop(0)(invocation)
 
 
-def writes(doc: object, cost: float = 0.5) -> Action:
+def writes(doc: object, cost: float = 0.5, session: str = "") -> Action:
     def action(inv: AgentInvocation) -> AgentOutcome:
-        out = inv.workdir / OUT_DIR / f"{inv.role.value}.json"
+        out = inv.workdir / OUT_DIR / f"{inv.step.value}.json"
         out.write_text(doc if isinstance(doc, str) else json.dumps(doc))
-        return AgentOutcome(ok=True, cost_usd=cost, input_tokens=10, output_tokens=5)
+        return AgentOutcome(
+            ok=True, cost_usd=cost, input_tokens=10, output_tokens=5, session_id=session
+        )
 
     return action
 
@@ -62,24 +66,28 @@ def edits_repo(inv: AgentInvocation) -> AgentOutcome:
 
 @pytest.fixture
 def workspace(target_repo: Path) -> Path:
-    return prepare_workspace(target_repo, "t1").path
+    return prepare_workspace(str(target_repo), "t1", branch="devloop/t1")[0].path
 
 
 def context() -> DevelopmentContext:
-    task = TaskInput(external_id="t1", repo_path="/x", title="t", description="d")
+    task = TaskInput(external_id="t1", repo="/x", title="t", description="d")
     return DevelopmentContext(
-        role=Role.REVIEWER, task=task, iteration=1, base_commit="abc", branch="b"
+        role=Role.REVIEWER,
+        step=Step.REVIEW,
+        task=task,
+        iteration=1,
+        base_commit="abc",
+        branch="b",
     )
 
 
 def run(workspace: Path, agent: ScriptedAgent, **kwargs: object):  # type: ignore[no-untyped-def]
     register_runtime("scripted", agent)
-    return run_role(
-        roles.REVIEWER,
+    return run_step(
+        roles.REVIEW,
         context(),
         workspace=workspace,
-        runtime="scripted",
-        model=None,
+        agent_config=AgentConfig(runtime="scripted"),
         budget_left_usd=kwargs.pop("budget", 10.0),  # type: ignore[arg-type]
         **kwargs,  # type: ignore[arg-type]
     )
@@ -174,3 +182,33 @@ def test_deterministic_check_triggers_repair(workspace: Path) -> None:
 
     assert result.artifact is not None
     assert "first look is never good enough" in agent.prompts[1]
+
+
+def test_resumes_the_given_session_and_says_so(workspace: Path) -> None:
+    agent = ScriptedAgent([writes(VALID_REVIEW, session="s-1")])
+
+    result = run(workspace, agent, session_id="s-1")
+
+    assert agent.resumed == ["s-1"]
+    assert agent.prompts[0].startswith("You are continuing the same task")
+    assert result.records[0].resumed and result.session_id == "s-1"
+
+
+def test_repair_retry_continues_the_same_session_with_a_short_prompt(workspace: Path) -> None:
+    agent = ScriptedAgent(
+        [writes({"verdict": "maybe"}, session="s-new"), writes(VALID_REVIEW, session="s-new")]
+    )
+
+    result = run(workspace, agent)
+
+    assert agent.resumed == [None, "s-new"]
+    assert agent.prompts[1].startswith("## Repair required"), "full prompt not resent"
+    assert result.session_id == "s-new"
+
+
+def test_repair_without_a_session_resends_the_full_prompt(workspace: Path) -> None:
+    agent = ScriptedAgent([writes({"verdict": "maybe"}), writes(VALID_REVIEW)])
+
+    run(workspace, agent)
+
+    assert agent.prompts[1].startswith("# Role: Reviewer")

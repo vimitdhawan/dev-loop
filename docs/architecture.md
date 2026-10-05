@@ -13,17 +13,25 @@ swap is a one-module change.
 ## What DevLoop is
 
 A task — a markdown file today, a GitHub issue later — becomes a reviewed,
-tested change through a fixed pipeline of specialist agents, with humans
+tested change through a fixed pipeline run by an agent **team**, with humans
 gating the two decisions that matter: *are the requirements right* and
 *should this merge*.
 
 ```
-task ──► requirements ──► plan ──► environment ──► implement ──► verify ──► review ──► change
-            ▲  ⏸ human                                              │          │
-            └──────────────────── replan ◄─────────────────────────┘          │
-                                  repair ◄─────────────────────────────────────┘
-                                                                    ⏸ human merge gate
+task ──► Product Owner ──► Engineer: plan ──► env ──► Engineer: implement ──► checks ──► QA ──► Reviewer ──► PR
+              ▲ ⏸ human        │  ▲ answers                 │                    │         │        │
+              └── questions ◄──┴──┴────────── questions ◄────┘                    │         │        │
+                                    replan ◄──────────────────────────────────────┼─────────┼────────┤
+                                    repair ◄──────────────────────────── red ─────┴── bugs ─┴─ changes
+                                                                                         ⏸ human merge gate
 ```
+
+| Role | Does | Session |
+|---|---|---|
+| Product Owner | requirements; answers the Engineer | kept |
+| Engineer | plans, implements, writes unit + integration tests, fixes | **one session** across all |
+| QA | tests the running app in a browser | kept across retests |
+| Reviewer | code review, final approval | **fresh every time** |
 
 ---
 
@@ -80,10 +88,10 @@ The things that must stay swappable, and what fills each slot over time:
 
 | Seam | v0 (today) | Later |
 |---|---|---|
-| **Source** | local CLI + markdown file | GitHub App webhooks, Jira, Linear |
-| **Runtime** | `claude` CLI, `opencode` CLI | `codex exec`, in-process Agent SDK |
-| **Sandbox** | per-task clone, commands run on host | Docker per task → E2B / Modal / k8s |
-| **Sink** | local branch + diff | GitHub PR + checks |
+| **Source** | local CLI + markdown file; repo = path or clone URL + base branch | GitHub App webhooks, Jira, Linear |
+| **Runtime** | `claude` CLI, `opencode` CLI — per role, from `devloop.config.yaml` | `codex exec`, in-process Agent SDK |
+| **Sandbox** | per-task fresh clone, commands + app run on host | Docker per task → E2B / Modal / k8s |
+| **Sink** | pushed branch + GitHub PR via `gh` (body = plan + evidence) | GitHub App, checks, pinned status comment |
 | **State** | SQLite checkpoints | Postgres + domain tables |
 | **Knowledge** | — | Postgres facts rendered into the sandbox |
 
@@ -105,10 +113,12 @@ Defined in `devloop.contracts`:
 
 | Contract | Produced by | Read by |
 |---|---|---|
-| `RequirementResult` | Requirement agent | `decide()` (`status` field) |
-| `PlanResult` | Planner | Developer, Reviewer |
+| `RequirementResult` | Product Owner | `decide()` (`status` field) |
+| `POAnswer` (`Clarification`) | Product Owner | Engineer (via context), `decide()` (`needs_human`) |
+| `PlanResult` (+ `questions_for_po`) | Engineer | Engineer, QA, Reviewer, `decide()` |
+| `QAResult` (`QAScenario`, `Finding`) | QA | `decide()` (`verdict`, `severity`), Engineer, Reviewer |
 | `EnvRecipe` | Bootstrap agent | Sandbox, cached per repo |
-| `ImplementationResult` (`Deviation`, `PlanInvalidation`, `FindingDispute`) | Developer | `decide()` (`plan_invalid`), Reviewer |
+| `ImplementationResult` (`Deviation`, `PlanInvalidation`, `FindingDispute`, `questions_for_po`) | Engineer | `decide()` (`plan_invalid`, questions), QA, Reviewer |
 | `DiffSummary` | **Orchestrator only** (git, after the Developer) | `decide()` (empty diff), Reviewer |
 | `TestRunResult` | **Orchestrator only** | `decide()` (baseline vs new failures) |
 | `ReviewResult` / `Finding` | Reviewer *and* humans | `decide()` (`verdict`, `severity`) |
@@ -222,16 +232,23 @@ Each fact carries `confidence`, `provenance: list[task_id]`,
 
 ## The graph
 
+16 nodes; each status maps to exactly one (`STATUS_TO_NODE` in
+`graph/build.py`, total over the enum).
+
 ```
-ingest → clarify ⏸ → plan → env_gate → env_bootstrap → baseline
-                                             ↓
-                                        implement → verify → review
-                                             ↑                  │
-                                    changes_required ◄──────────┘
-                                      ↓         ↓
-                                 replanning   escalate ⏸
-                                             ↓
-                                        finalize ⏸ → done
+ingest (PO: requirements) ─► clarify ⏸ ◄──────────────┐ needs_human
+        │                        │                      │
+        ▼                        ▼                      │
+      plan (Engineer) ◄──── answers ──── consult_po (PO) ◄── questions_for_po
+        │                                               ▲   (from plan, replanning, implement)
+        ▼                                               │
+   env_gate ─► env_bootstrap ─► baseline ─► implement (Engineer, same session)
+                                               │  ▲
+                                               ▼  │ changes_required ◄── red checks / QA bugs / review
+                                            verify ─► qa_test (QA + app) ─► review (fresh) ─► publish (push + PR)
+                                                                                                 │
+                                         replanning ◄── plan_conformance / plan_invalid          ▼
+                                         escalate ⏸ ◄── budget, caps, agent failure          finalize ⏸ → done
 ```
 
 **Node granularity is dictated by a LangGraph constraint, not by taste.**
@@ -250,9 +267,13 @@ twice. Therefore:
 | Guard | Rule |
 |---|---|
 | Budget | any in-flight status → `ESCALATED` once `cost_usd >= budget_usd` |
-| Review iterations | `CHANGES_REQUIRED → IMPLEMENTING` only while `iteration < 3` |
-| Replans | plan-conformance findings → `REPLANNING` only while `replan_count < 2` |
-| Regression | `REVIEWING → READY_FOR_FINALIZE` requires `approved` **and** no failure absent from baseline |
+| Failed side effect | any in-flight status → `ESCALATED` once a node records `escalation_reason` |
+| Review iterations | `CHANGES_REQUIRED → IMPLEMENTING` only while `iteration < 3` (attempts, not questions) |
+| Replans | plan-conformance findings or `plan_invalid` → `REPLANNING` only while `replan_count < 2` |
+| PO consultations | Engineer questions → `CONSULTING_PO` only while `po_consultations < 3` |
+| Red before QA | `TESTING` with a failure absent from baseline → `CHANGES_REQUIRED` (no QA/review spend) |
+| QA | `failed`, or any unresolved P0/P1 → `CHANGES_REQUIRED`; `blocked` → `ESCALATED` |
+| Publish | `REVIEWING → PUBLISHING` requires `approved`, no unresolved P0/P1, no new failures **and** QA `passed`/`skipped` |
 
 `ESCALATED` means *needs a human*, not dead. `CANCELLED` and `FINALIZED` are
 terminal.
@@ -283,8 +304,11 @@ without it, the improvement engine has nothing to learn from.
 ## Why this stack
 
 **LangGraph + LangSmith (Python).** The graph gives durable checkpoints,
-human-in-the-loop interrupts and resume for free, and LangSmith gives trace
-inspection without building a UI. The cost is a framework whose value is
+human-in-the-loop interrupts and resume for free, and LangGraph Studio
+(`langgraph dev`) gives a live view of the graph, its state and its
+interrupts without building a UI — the same compiled graph the CLI runs is
+exported in `graph/studio.py`. LangSmith tracing is opt-in (it sends task
+content off the machine). The cost is a framework whose value is
 mostly realised at the human gates rather than in agent orchestration —
 because the agents are subprocesses, the orchestrator itself makes no model
 calls.

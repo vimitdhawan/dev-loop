@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from devloop.contracts.runs import Role
+from devloop.contracts.runs import Role, Step
 
 log = logging.getLogger("devloop.agent")
 
@@ -44,16 +44,26 @@ READ_ONLY_SHELL = (
 
 
 @dataclass(frozen=True)
+class McpServer:
+    """A local stdio MCP server the agent gets, e.g. Playwright for QA."""
+
+    name: str
+    command: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ToolPolicy:
     # False: the agent may write only under `.devloop/out/`.
     can_edit: bool = False
     # Command prefixes the agent may run. Empty: no shell at all.
     bash_allow: tuple[str, ...] = ()
+    mcp_servers: tuple[McpServer, ...] = ()
 
 
 @dataclass(frozen=True)
 class AgentInvocation:
     role: Role
+    step: Step
     prompt: str
     workdir: Path
     tools: ToolPolicy
@@ -61,6 +71,8 @@ class AgentInvocation:
     model: str | None = None
     max_budget_usd: float | None = None
     timeout_s: int = 600
+    # Continue this agent session instead of starting a fresh one.
+    resume_session: str | None = None
 
 
 @dataclass
