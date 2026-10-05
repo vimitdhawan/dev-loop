@@ -7,10 +7,13 @@ import pytest
 from devloop.agents.checks import (
     check_implementation,
     check_plan,
+    check_po_answer,
+    check_qa,
     check_requirements,
     check_review,
 )
 from devloop.contracts.artifacts import (
+    Clarification,
     FileAction,
     FileToChange,
     Finding,
@@ -18,6 +21,10 @@ from devloop.contracts.artifacts import (
     FindingDispute,
     ImplementationResult,
     PlanResult,
+    POAnswer,
+    QAResult,
+    QAScenario,
+    QAVerdict,
     RequirementResult,
     RequirementStatus,
     ReviewResult,
@@ -107,3 +114,39 @@ def test_check_implementation_rejects_disputes_of_unknown_findings() -> None:
     assert check_implementation(impl, {"R1"})
     assert not check_implementation(impl, {"R9"})
     assert not check_implementation(ImplementationResult(summary="s"), set())
+
+
+def test_plan_waiting_on_questions_skips_the_file_checks(repo: Path) -> None:
+    on_hold = PlanResult(summary="s", questions_for_po=["which format?"])
+    assert check_plan(on_hold, repo) == []
+
+
+def _scenario() -> QAScenario:
+    return QAScenario(criterion="c", passed=True)
+
+
+@pytest.mark.parametrize(
+    "qa,ok",
+    [
+        (QAResult(verdict=QAVerdict.PASSED, scenarios=[_scenario()]), True),
+        (QAResult(verdict=QAVerdict.PASSED), False),  # tested nothing
+        (QAResult(verdict=QAVerdict.FAILED, scenarios=[_scenario()]), False),  # no bugs listed
+        (
+            QAResult(verdict=QAVerdict.FAILED, scenarios=[_scenario()], findings=[_finding("Q1")]),
+            True,
+        ),
+        (QAResult(verdict=QAVerdict.BLOCKED), False),  # no reason
+        (QAResult(verdict=QAVerdict.BLOCKED, notes="needs a login"), True),
+        (QAResult(verdict=QAVerdict.SKIPPED), False),  # orchestrator-only verdict
+    ],
+)
+def test_check_qa(qa: QAResult, ok: bool) -> None:
+    assert (check_qa(qa) == []) is ok
+
+
+def test_check_po_answer_requires_every_question_covered() -> None:
+    questions = ["a?", "b?"]
+    answered = Clarification(question="a?", answer="yes", answered_by="product_owner")
+
+    assert check_po_answer(POAnswer(answers=[answered]), questions)
+    assert not check_po_answer(POAnswer(answers=[answered], needs_human=["b?"]), questions)

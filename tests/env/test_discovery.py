@@ -74,3 +74,18 @@ def test_yaml_scalars_are_read_as_commands(tmp_path: Path) -> None:
 
     assert recipe is not None
     assert recipe.setup == ["true"] and recipe.commands == {"unit": "true"}
+
+
+def test_app_section_is_read(tmp_path: Path) -> None:
+    (tmp_path / "devloop.yml").write_text(
+        "commands:\n  unit: npm test\n"
+        "app:\n  start: npm run dev -- -p 3100\n  url: http://localhost:3100\n"
+        "  setup: [supabase start]\n"
+    )
+
+    recipe = discover_recipe(tmp_path, "abc")
+
+    assert recipe is not None and recipe.app is not None
+    assert recipe.app.url == "http://localhost:3100"
+    assert recipe.app.setup == ["supabase start"]
+    assert recipe.app.ready_timeout_s == 120

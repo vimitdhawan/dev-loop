@@ -1,18 +1,27 @@
-"""Graph node implementations.
+"""Graph node implementations — the team at work.
+
+    Product Owner ──► Engineer: plan ──► (plan check) ──► Engineer: implement
+          ▲   questions │                                  │ questions
+          └─────────────┴──────────────────────────────────┘
+    implement ──► checks ──► QA (browser) ──► Reviewer (fresh) ──► publish/PR
+        ▲            │ red        │ bugs            │ changes
+        └────────────┴────────────┴─────────────────┘
+
+Agents never talk to each other directly. An Engineer's question is a
+field in its output document; the orchestrator routes it to the Product
+Owner's session (or to a human) and resumes the Engineer's session with
+the answer. Every hand-off is a stored fact.
 
 Node granularity follows LangGraph's re-execution rule: `interrupt()`
-re-runs its node from the top on resume (checkpoints only exist at node
-boundaries), so `clarify`, `finalize` and `escalate` do *nothing but*
-interrupt, and every side effect (git, agent runs, check runs) lives in
-its own node and is idempotent where a crash-resume could repeat it.
+re-runs its node from the top on resume, so `clarify`, `finalize` and
+`escalate` do *nothing but* interrupt, and every side effect (git, agent
+runs, check runs, the app, the PR) lives in its own node and is idempotent
+where a crash-resume could repeat it.
 
 Every node ends the same way: compute facts, then call `decide()` with
-those facts folded into the state to get the next status, and return
-`{"status": next_status, **facts}`.
-
-A side effect that fails in a way only a human can fix (`DevLoopError`)
-becomes the `escalation_reason` fact — `decide()` then escalates. Nodes
-never pick a status themselves, failure included.
+those facts folded into the state to get the next status. A side effect
+that fails in a way only a human can fix (`DevLoopError`) becomes the
+`escalation_reason` fact — `decide()` then escalates.
 """
 
 from __future__ import annotations
@@ -28,22 +37,31 @@ from devloop.agents import roles
 from devloop.agents.checks import (
     check_implementation,
     check_plan,
+    check_po_answer,
+    check_qa,
     check_requirements,
     check_review,
 )
-from devloop.agents.harness import RoleRun, RoleSpec, run_role
+from devloop.agents.harness import StepRun, StepSpec, run_step
 from devloop.contracts.artifacts import (
+    Clarification,
+    Finding,
     FindingCategory,
+    QAResult,
+    QAVerdict,
     RequirementResult,
     RequirementStatus,
+    Severity,
 )
 from devloop.contracts.context import DevelopmentContext, VerificationSummary
-from devloop.contracts.runs import RuntimeConfig
+from devloop.contracts.runs import PullRequestConfig, TeamConfig
 from devloop.contracts.state import DevLoopState, DiffSummary
 from devloop.contracts.status import DevLoopStatus as St
+from devloop.env.app import AppEnvironmentError, AppError, running_app
 from devloop.env.discovery import discover_recipe
 from devloop.env.runner import run_checks
 from devloop.errors import DevLoopError
+from devloop.graph.inputs import is_raw_input, normalize_input
 from devloop.graph.routing import (
     decide,
     failure_keys,
@@ -54,13 +72,18 @@ from devloop.graph.routing import (
 from devloop.paths import task_dir
 from devloop.runtimes.base import IN_DIR
 from devloop.sandbox.workspace import (
+    branch_name,
     commit_all,
     diff_patch,
     diff_stat,
     discard_changes,
+    github_slug,
+    origin_url,
     prepare_workspace,
     publish_branch,
 )
+from devloop.sink.github import open_or_update_pr
+from devloop.sink.summary import render_summary
 
 Node = Callable[[DevLoopState], dict[str, Any]]
 
@@ -70,6 +93,8 @@ _AGENT_OUTPUT_TAIL = 3_000
 
 def _advance(state: DevLoopState, **facts: Any) -> dict[str, Any]:
     local = cast(DevLoopState, {**state, **facts})
+    # raw input (LangGraph Studio) may carry the status as a plain string, or none
+    local["status"] = St(local.get("status") or St.RECEIVED)
     next_status = decide(local)
     return {**facts, "status": next_status}
 
@@ -94,47 +119,65 @@ def _workspace(state: DevLoopState) -> Path:
     return Path(path)
 
 
-def _context(state: DevLoopState, spec: RoleSpec[Any], **extra: Any) -> DevelopmentContext:
+def _with(state: DevLoopState, **facts: Any) -> DevLoopState:
+    return cast(DevLoopState, {**state, **facts})
+
+
+def _context(state: DevLoopState, spec: StepSpec[Any], **extra: Any) -> DevelopmentContext:
     return DevelopmentContext(
         role=spec.role,
+        step=spec.step,
         task=state["task"],
         iteration=extra.pop("iteration", state.get("iteration", 0)),
         base_commit=state.get("base_commit") or "",
         branch=state.get("branch") or "",
         requirements=state.get("requirements"),
+        clarifications=state.get("clarifications", []),
         plan=state.get("plan"),
+        commands=_commands(state),
         **extra,
     )
 
 
 def _run(
     state: DevLoopState,
-    spec: RoleSpec[Any],
+    spec: StepSpec[Any],
     context: DevelopmentContext,
     check: Callable[[Any], list[str]] | None = None,
-) -> RoleRun[Any]:
-    runtime = state.get("runtime") or RuntimeConfig()
+) -> StepRun[Any]:
+    team = state.get("team") or TeamConfig()
     budget = state.get("budget_usd")
-    return run_role(
+    session = (
+        state.get("sessions", {}).get(spec.role.value) if spec.role in roles.SESSION_ROLES else None
+    )
+    return run_step(
         spec,
         context,
         workspace=_workspace(state),
-        runtime=runtime.runtime_for(spec.role),
-        model=runtime.model,
+        agent_config=team.for_role(spec.role),
         budget_left_usd=None if budget is None else budget - state.get("cost_usd", 0.0),
+        session_id=session,
         check=check,
-        timeout_s=runtime.agent_timeout_s,
     )
 
 
-def _run_facts(state: DevLoopState, run: RoleRun[Any]) -> dict[str, Any]:
+def _run_facts(state: DevLoopState, spec: StepSpec[Any], run: StepRun[Any]) -> dict[str, Any]:
     facts: dict[str, Any] = {
         "agent_runs": run.records,
         "cost_usd": state.get("cost_usd", 0.0) + run.cost_usd,
     }
+    if spec.role in roles.SESSION_ROLES and run.session_id:
+        facts["sessions"] = {**state.get("sessions", {}), spec.role.value: run.session_id}
     if run.error:
         facts["escalation_reason"] = run.error
     return facts
+
+
+def _ask_po(status: St, questions: list[str]) -> dict[str, Any]:
+    return {"pending_questions": questions, "consult_return": status}
+
+
+_ANSWERED: dict[str, Any] = {"pending_questions": [], "consult_return": None}
 
 
 def _verification_summaries(state: DevLoopState) -> list[VerificationSummary]:
@@ -162,6 +205,14 @@ def _commands(state: DevLoopState) -> dict[str, str]:
     return commands
 
 
+def _write_diff(state: DevLoopState) -> str:
+    ws = _workspace(state)
+    rel = f"{IN_DIR}/diff.patch"
+    (ws / rel).parent.mkdir(parents=True, exist_ok=True)
+    (ws / rel).write_text(diff_patch(ws, state.get("base_commit") or "HEAD"))
+    return rel
+
+
 def _answer_text(payload: object) -> str:
     """`devloop resume --answer X` sends `{"answer": X}`; a bare resume
     sends `"approve"`."""
@@ -171,42 +222,75 @@ def _answer_text(payload: object) -> str:
     return str(payload).strip()
 
 
+def _stamp(findings: list[Finding], source: str) -> list[Finding]:
+    """The orchestrator, not the agent, records who raised a finding."""
+
+    return [f.model_copy(update={"source": source}) for f in findings]
+
+
 # --- nodes -----------------------------------------------------------------
 
 
 @_escalate_on_error
 def ingest(state: DevLoopState) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    if is_raw_input(state):
+        # started from plain JSON (LangGraph Studio): build the typed initial
+        # state, and persist it as this node's facts
+        state = normalize_input(state)
+        facts.update(state)
     task = state["task"]
-    ws = prepare_workspace(Path(task.repo_path), task.external_id)
-    facts: dict[str, Any] = {
+    ws, base = prepare_workspace(
+        task.repo,
+        task.external_id,
+        branch=state.get("branch") or branch_name(task.external_id, task.title),
+        base_branch=task.base_branch,
+    )
+    facts |= {
         "workspace_path": str(ws.path),
+        "base_branch": base,
         "base_commit": ws.base_commit,
         "branch": ws.branch,
     }
-    state = cast(DevLoopState, {**state, **facts})
+    state = _with(state, **facts)
 
-    run = _run(state, roles.REQUIREMENT, _context(state, roles.REQUIREMENT), check_requirements)
-    facts.update(_run_facts(state, run))
+    spec = roles.REQUIREMENTS
+    run = _run(state, spec, _context(state, spec), check_requirements)
+    facts.update(_run_facts(state, spec, run))
     if run.artifact is not None:
         facts["requirements"] = run.artifact
     return _advance(state, **facts)
 
 
 def clarify(state: DevLoopState) -> dict[str, Any]:
-    """Pauses for a human answer. Everything before `interrupt()` must be
-    idempotent, because resuming replays this node from the top."""
+    """Pauses for a human: either the Product Owner's questions about the
+    task, or an Engineer's question the Product Owner couldn't answer.
+    Everything before `interrupt()` must be idempotent — resuming replays
+    this node from the top."""
 
+    pending = state.get("pending_questions", [])
     req = state.get("requirements")
-    if req is not None and req.status == RequirementStatus.READY:
-        return _advance(state, requirements=req)
+    if not pending and req is not None and req.status == RequirementStatus.READY:
+        return _advance(state)
 
-    questions = req.questions if req else []
-    payload = interrupt({"task": state["task"].title, "questions": questions})
-    answer = _answer_text(payload)
+    questions = pending or (req.questions if req else [])
+    payload = interrupt(
+        {
+            "gate": "clarify",
+            "asked_by": "engineer (via product owner)" if pending else "product owner",
+            "task": state["task"].title,
+            "questions": questions,
+        }
+    )
+    answer = _answer_text(payload) or "no answer given; use your best judgement"
+    asked = "; ".join(questions) or "clarification"
+    clarification = Clarification(question=asked, answer=answer, answered_by="human")
+
+    if pending:
+        return _advance(state, clarifications=[clarification], pending_questions=[])
+
     constraints = list(req.constraints) if req else []
-    if answer:
-        asked = "; ".join(questions) or "clarification"
-        constraints.append(f"Human answer to [{asked}]: {answer}")
+    constraints.append(f"Human answer to [{asked}]: {answer}")
     resolved = RequirementResult(
         status=RequirementStatus.READY,
         summary=req.summary if req else state["task"].title,
@@ -214,22 +298,76 @@ def clarify(state: DevLoopState) -> dict[str, Any]:
         constraints=constraints,
         questions=[],
     )
-    return _advance(state, requirements=resolved)
+    return _advance(state, requirements=resolved, clarifications=[clarification])
+
+
+@_escalate_on_error
+def consult_po(state: DevLoopState) -> dict[str, Any]:
+    """The Product Owner answers the Engineer, in its own session — it
+    still remembers exploring the task when it wrote the requirements."""
+
+    questions = state.get("pending_questions", [])
+    spec = roles.PO_ANSWER
+    run = _run(
+        state,
+        spec,
+        _context(state, spec, questions=questions),
+        lambda a: check_po_answer(a, questions),
+    )
+    facts: dict[str, Any] = {
+        **_run_facts(state, spec, run),
+        "po_consultations": state.get("po_consultations", 0) + 1,
+    }
+    if run.artifact is not None:
+        facts["clarifications"] = [
+            a.model_copy(update={"answered_by": "product_owner"}) for a in run.artifact.answers
+        ]
+        facts["pending_questions"] = run.artifact.needs_human
+    return _advance(state, **facts)
+
+
+def _plan(state: DevLoopState, *, replan_reason: str | None) -> dict[str, Any]:
+    ws = _workspace(state)
+    spec = roles.PLAN
+    run = _run(
+        state,
+        spec,
+        _context(state, spec, replan_reason=replan_reason),
+        lambda p: check_plan(p, ws),
+    )
+    facts = _run_facts(state, spec, run)
+    if run.artifact is not None and run.artifact.questions_for_po:
+        facts.update(_ask_po(state["status"], run.artifact.questions_for_po))
+    elif run.artifact is not None:
+        facts.update(_ANSWERED, plan=run.artifact)
+        if replan_reason is not None:
+            facts["replan_count"] = state.get("replan_count", 0) + 1
+    return _advance(state, **facts)
 
 
 @_escalate_on_error
 def plan(state: DevLoopState) -> dict[str, Any]:
-    ws = _workspace(state)
-    run = _run(
-        state,
-        roles.PLANNER,
-        _context(state, roles.PLANNER, commands=_commands(state)),
-        lambda p: check_plan(p, ws),
-    )
-    facts = _run_facts(state, run)
-    if run.artifact is not None:
-        facts["plan"] = run.artifact
-    return _advance(state, **facts)
+    return _plan(state, replan_reason=None)
+
+
+@_escalate_on_error
+def replanning(state: DevLoopState) -> dict[str, Any]:
+    impl = state.get("implementation")
+    reason = state.get("replan_reason")  # set when resuming after a question
+    if not reason and impl is not None and impl.plan_invalid is not None:
+        reason = f"{impl.plan_invalid.reason}\nEvidence: {impl.plan_invalid.evidence}"
+    if not reason:
+        reason = "\n".join(
+            f"{f.id}: {f.description} -> {f.recommendation}"
+            for f in open_findings(state)
+            if f.category == FindingCategory.PLAN_CONFORMANCE
+        )
+    # plan cleared so `REPLANNING` only advances on the new plan
+    result = _plan(_with(state, plan=None), replan_reason=reason)
+    result.setdefault("plan", None)
+    # the reason is only kept while the replan waits on an answer
+    result["replan_reason"] = reason if result.get("pending_questions") else None
+    return result
 
 
 def env_gate(state: DevLoopState) -> dict[str, Any]:
@@ -279,47 +417,54 @@ def baseline(state: DevLoopState) -> dict[str, Any]:
 def implement(state: DevLoopState) -> dict[str, Any]:
     task = state["task"]
     ws = _workspace(state)
-    iteration = state.get("iteration", 0) + 1
-    spec = roles.developer(state.get("env"))
+    attempt = state.get("iteration", 0) + 1
+    spec = roles.implement(state.get("env"))
     findings = open_findings(state)
     context = _context(
         state,
         spec,
-        iteration=iteration,
+        iteration=attempt,
         open_findings=findings,
-        verification=_verification_summaries(state),
-        commands=_commands(state),
+        verification=_verification_summaries(state) if attempt > 1 else [],
     )
     finding_ids = {f.id for f in findings}
     run = _run(state, spec, context, lambda impl: check_implementation(impl, finding_ids))
-    # `review: None` — a review of the previous attempt says nothing about
-    # this one, and must not be mistaken for it by `decide()`.
-    facts: dict[str, Any] = {
-        **_run_facts(state, run),
-        "iteration": iteration,
-        "implementation": run.artifact,
-        "review": None,
-        "diff": None,
-    }
+    facts: dict[str, Any] = _run_facts(state, spec, run)
     if run.artifact is None:
         return _advance(state, **facts)
 
+    if run.artifact.questions_for_po:
+        # Nothing is committed and the attempt isn't counted: the same
+        # session picks up where it stopped once the answer is in.
+        facts.update(_ask_po(St.IMPLEMENTING, run.artifact.questions_for_po))
+        return _advance(state, **facts)
+
+    # `qa`/`review: None` — reports on the previous attempt say nothing
+    # about this one, and must not be mistaken for it by `decide()`.
+    facts.update(
+        _ANSWERED,
+        iteration=attempt,
+        implementation=run.artifact,
+        prior_findings=findings,
+        qa=None,
+        review=None,
+        diff=None,
+    )
     if run.artifact.plan_invalid is not None:
         discard_changes(ws)
         return _advance(state, **facts)
 
-    commit = commit_all(ws, f"devloop: {task.title} (iteration {iteration})")
+    commit = commit_all(ws, f"devloop: {task.title} (iteration {attempt})")
     if not commit.files_changed:
         facts["diff"] = DiffSummary()
         disputes = run.artifact.disputed_findings
         facts["escalation_reason"] = (
-            "the developer disputes " + "; ".join(f"{d.finding_id}: {d.reason}" for d in disputes)
+            "the engineer disputes " + "; ".join(f"{d.finding_id}: {d.reason}" for d in disputes)
             if disputes
-            else "the developer made no changes and did not declare the plan invalid"
+            else "the engineer made no changes and did not declare the plan invalid"
         )
         return _advance(state, **facts)
 
-    publish_branch(ws, state.get("branch") or f"devloop/{task.external_id}")
     total = diff_stat(ws, state.get("base_commit") or "HEAD")
     facts["diff"] = DiffSummary(
         files_changed=total.files_changed,
@@ -345,27 +490,85 @@ def verify(state: DevLoopState) -> dict[str, Any]:
 
 
 @_escalate_on_error
-def review(state: DevLoopState) -> dict[str, Any]:
-    ws = _workspace(state)
-    diff_rel = f"{IN_DIR}/diff.patch"
-    (ws / diff_rel).parent.mkdir(parents=True, exist_ok=True)
-    (ws / diff_rel).write_text(diff_patch(ws, state.get("base_commit") or "HEAD"))
+def qa_test(state: DevLoopState) -> dict[str, Any]:
+    env = state.get("env")
+    app = env.app if env else None
+    if app is None:
+        skipped = QAResult(verdict=QAVerdict.SKIPPED, notes="devloop.yml has no app: section")
+        return _advance(state, qa=skipped)
 
+    iteration = state.get("iteration", 0)
+    evidence_dir = f".devloop/qa/iteration-{iteration}"
+    ws = _workspace(state)
+    (ws / evidence_dir).mkdir(parents=True, exist_ok=True)
+    spec = roles.qa(str(ws / evidence_dir))
     impl = state.get("implementation")
     context = _context(
         state,
-        roles.REVIEWER,
-        diff_path=diff_rel,
+        spec,
+        app_url=app.url,
+        evidence_dir=evidence_dir,
+        prior_findings=state.get("prior_findings", []),
+        developer_notes=impl.summary if impl else "",
+    )
+    log_dir = task_dir(state["task"].external_id) / "app" / f"iteration-{iteration}"
+    try:
+        with running_app(ws, app, log_dir):
+            run = _run(state, spec, context, check_qa)
+    except AppEnvironmentError:
+        raise  # not the Engineer's doing — escalate
+    except AppError as exc:
+        # The change doesn't start: a bug like any other, for the Engineer.
+        broken = QAResult(
+            verdict=QAVerdict.FAILED,
+            findings=[
+                Finding(
+                    id="QA-APP",
+                    severity=Severity.P0,
+                    category=FindingCategory.FUNCTIONAL,
+                    description=f"The app does not start: {exc}",
+                    recommendation="Make the app start and serve its URL again.",
+                    source="orchestrator",
+                )
+            ],
+            notes="app failed to start",
+        )
+        return _advance(state, qa=broken)
+
+    facts = _run_facts(state, spec, run)
+    if run.artifact is not None:
+        facts["qa"] = run.artifact.model_copy(
+            update={"findings": _stamp(run.artifact.findings, "qa")}
+        )
+        if run.artifact.verdict == QAVerdict.BLOCKED:
+            facts["escalation_reason"] = f"QA is blocked: {run.artifact.notes}"
+    return _advance(state, **facts)
+
+
+@_escalate_on_error
+def review(state: DevLoopState) -> dict[str, Any]:
+    """Always a fresh session: the Reviewer must not inherit anyone's
+    assumptions — including its own from the previous round."""
+
+    impl = state.get("implementation")
+    spec = roles.REVIEW
+    context = _context(
+        state,
+        spec,
+        diff_path=_write_diff(state),
         deviations=impl.deviations if impl else [],
         disputed_findings=impl.disputed_findings if impl else [],
         developer_notes=impl.notes_for_reviewer if impl else "",
         verification=_verification_summaries(state),
-        commands=_commands(state),
+        qa=state.get("qa"),
+        prior_findings=state.get("prior_findings", []),
     )
-    run = _run(state, roles.REVIEWER, context, check_review)
-    facts = _run_facts(state, run)
+    run = _run(state, spec, context, check_review)
+    facts = _run_facts(state, spec, run)
     if run.artifact is not None:
-        facts["review"] = run.artifact
+        facts["review"] = run.artifact.model_copy(
+            update={"findings": _stamp(run.artifact.findings, "reviewer")}
+        )
     return _advance(state, **facts)
 
 
@@ -377,48 +580,52 @@ def changes_required(state: DevLoopState) -> dict[str, Any]:
 
 
 @_escalate_on_error
-def replanning(state: DevLoopState) -> dict[str, Any]:
-    impl = state.get("implementation")
-    if impl is not None and impl.plan_invalid is not None:
-        reason = f"{impl.plan_invalid.reason}\nEvidence: {impl.plan_invalid.evidence}"
-    else:
-        reason = "\n".join(
-            f"{f.id}: {f.description} -> {f.recommendation}"
-            for f in open_findings(state)
-            if f.category == FindingCategory.PLAN_CONFORMANCE
-        )
-    state = cast(DevLoopState, {**state, "replan_reason": reason})
+def publish(state: DevLoopState) -> dict[str, Any]:
+    """Push the approved branch and open (or update) the PR. The PR body is
+    the plan and the evidence, so the human reviews *what was meant*, not
+    just the diff."""
+
+    task = state["task"]
     ws = _workspace(state)
-    run = _run(
-        state,
-        roles.PLANNER,
-        _context(state, roles.PLANNER, replan_reason=reason, commands=_commands(state)),
-        lambda p: check_plan(p, ws),
-    )
-    facts: dict[str, Any] = {
-        **_run_facts(state, run),
-        "replan_reason": reason,
-        "replan_count": state.get("replan_count", 0) + 1,
-        # cleared so `PLANNING | REPLANNING` only advances on the new plan
-        "plan": run.artifact,
-    }
+    branch = state.get("branch") or ""
+    body_file = task_dir(task.external_id) / "summary.md"
+    body_file.write_text(render_summary(state))
+
+    publish_branch(ws, branch)
+    facts: dict[str, Any] = {"pull_request_url": None}
+    pr = state.get("pull_request") or PullRequestConfig()
+    slug = github_slug(origin_url(ws))
+    if pr.enabled and slug is not None:
+        facts["pull_request_url"] = open_or_update_pr(
+            workspace=ws,
+            repo=slug,
+            base=state.get("base_branch") or "main",
+            head=branch,
+            title=task.title,
+            body_file=body_file,
+            draft=pr.draft,
+        )
     return _advance(state, **facts)
 
 
 def finalize(state: DevLoopState) -> dict[str, Any]:
-    """Pauses for the human merge/cancel decision."""
+    """Pauses for the human decision. With a PR, merging happens on GitHub;
+    `approve` here just closes the task."""
 
+    task = state["task"]
     decision = interrupt(
         {
             "gate": "finalize",
-            "task": state["task"].title,
+            "task": task.title,
+            "pull_request": state.get("pull_request_url"),
             "branch": state.get("branch"),
             "inspect": (
-                f"git -C {state['task'].repo_path} diff "
-                f"{(state.get('base_commit') or '')[:10]}..{state.get('branch')}"
+                f"git -C {task.repo} diff {state.get('base_branch')}...{state.get('branch')}"
+                if Path(task.repo).exists()
+                else None
             ),
+            "summary": str(task_dir(task.external_id) / "summary.md"),
             "cost_usd": round(state.get("cost_usd", 0.0), 4),
-            "review": state.get("review"),
             "answer": "approve | cancel",
         }
     )
@@ -428,8 +635,8 @@ def finalize(state: DevLoopState) -> dict[str, Any]:
 
 
 def escalate(state: DevLoopState) -> dict[str, Any]:
-    """Pauses until a human cancels. Retrying from the escalated step is
-    Phase 3; until then any other answer keeps the task parked here."""
+    """Pauses until a human cancels. Any other answer keeps the task parked
+    here; retry-from-here is not built yet."""
 
     decision = interrupt(
         {

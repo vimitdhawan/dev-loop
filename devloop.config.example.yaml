@@ -1,0 +1,35 @@
+# DevLoop operator config. Copy to ./devloop.config.yaml or
+# ~/.devloop/config.yaml (or point DEVLOOP_CONFIG at it).
+# Precedence: CLI flag > environment variable > this file > default.
+
+# The agent team. runtime: claude | opencode | stub. model: whatever the
+# runtime accepts (claude: sonnet, opus, haiku or a full id). timeout_s:
+# seconds per agent run (default: 10-30 min depending on the step).
+agents:
+  product_owner:          # writes requirements, answers the Engineer's questions
+    runtime: claude
+    model: sonnet
+  engineer:               # plans and implements in ONE session — one runtime/model
+    runtime: claude
+    model: opus
+    timeout_s: 2400
+  qa:                     # tests the running app in a browser (Playwright MCP)
+    runtime: claude
+    model: sonnet
+  reviewer:               # always a fresh session; final approver
+    runtime: claude
+    model: opus
+
+# Where the code comes from. A clone URL or a local path; the task always
+# works in a fresh clone of base_branch. Env: DEVLOOP_REPO_URL, DEVLOOP_BASE_BRANCH.
+repo:
+  url: https://github.com/your-org/your-repo.git
+  base_branch: main
+
+# After the Reviewer approves, the branch is pushed and — for GitHub
+# remotes — a PR is opened with `gh` (uses your `gh auth` / GH_TOKEN).
+pull_request:
+  enabled: true
+  draft: false
+
+budget_usd: 20

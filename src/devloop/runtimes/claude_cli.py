@@ -14,12 +14,15 @@ Isolation choices, all deliberate:
   Runs are reproducible across machines, which the eval loop depends on.
   The repo's `CLAUDE.md` still loads: its conventions are wanted.
 - `--max-budget-usd` caps a single run at what's left of the task budget.
+- Sessions persist so a role can be resumed with `--resume <id>`; MCP
+  servers (Playwright for QA) come only from the per-run `--mcp-config`.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 from devloop.runtimes.base import (
     OUT_DIR,
@@ -45,13 +48,13 @@ class ClaudeCLIAgent:
         if inv.tools.bash_allow:
             tools.append("Bash")
             allowed.extend(f"Bash({prefix}*)" for prefix in inv.tools.bash_allow)
+        allowed.extend(f"mcp__{server.name}" for server in inv.tools.mcp_servers)
 
         argv = [
             self.binary,
             "-p",
             "--output-format",
             "json",
-            "--no-session-persistence",
             "--permission-mode",
             "dontAsk",
             "--setting-sources",
@@ -62,11 +65,25 @@ class ClaudeCLIAgent:
             "--allowedTools",
             *allowed,
         ]
+        if inv.tools.mcp_servers:
+            argv += ["--mcp-config", str(self.write_mcp_config(inv))]
+        if inv.resume_session:
+            argv += ["--resume", inv.resume_session]
         if inv.model:
             argv += ["--model", inv.model]
         if inv.max_budget_usd is not None:
             argv += ["--max-budget-usd", f"{inv.max_budget_usd:.2f}"]
         return argv
+
+    def write_mcp_config(self, inv: AgentInvocation) -> Path:
+        path = inv.log_path.with_suffix(".mcp.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        servers = {
+            s.name: {"command": s.command[0], "args": list(s.command[1:])}
+            for s in inv.tools.mcp_servers
+        }
+        path.write_text(json.dumps({"mcpServers": servers}, indent=2))
+        return path
 
     def run(self, invocation: AgentInvocation) -> AgentOutcome:
         code, out, err = run_process(

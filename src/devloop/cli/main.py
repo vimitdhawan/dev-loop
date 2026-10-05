@@ -1,9 +1,12 @@
 """`devloop` local CLI — the v0 source and sink.
 
-`devloop run` drives a task from a markdown file through the graph to a
-`devloop/<task-id>` branch in the target repo: no GitHub App, no webhook,
-no public endpoint. Human gates (`clarify`, `finalize`, `escalate`) are
-answered from the terminal via LangGraph's `interrupt()`/`Command(resume=...)`.
+`devloop run` drives a task from a markdown file through the agent team to
+a pushed `devloop/<task-id>-<slug>` branch — and a PR when the repo is on
+GitHub. Human gates (`clarify`, `finalize`, `escalate`) are answered from
+the terminal via LangGraph's `interrupt()`/`Command(resume=...)`.
+
+Who is on the team comes from `devloop.config.yaml` (see
+`devloop.config.example.yaml`); flags override it for one run.
 """
 
 from __future__ import annotations
@@ -11,21 +14,26 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+import yaml
 from langgraph.types import Command
 from rich import print as rprint
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
 
-from devloop.contracts.runs import Role, RuntimeConfig
-from devloop.contracts.state import BUDGET_USD_DEFAULT, DevLoopState, TaskInput
-from devloop.contracts.status import DevLoopStatus
+from devloop.config import ConfigError, DevLoopConfig, config_path, load_config
+from devloop.contracts.runs import Role
+from devloop.contracts.state import TaskInput
 from devloop.graph.build import build_graph
+from devloop.graph.inputs import new_task_state
 from devloop.paths import workspace_dir
+from devloop.runtimes.probe import check_model
+from devloop.runtimes.probe import probe as run_probe
 from devloop.runtimes.registry import known_runtimes
 from devloop.store.checkpointer import checkpointer
 
@@ -41,91 +49,205 @@ def _setup_logging() -> None:
     )
 
 
-def _runtime_config(
-    runtime: str, model: str | None, role_runtime: list[str], agent_timeout: int | None
-) -> RuntimeConfig:
-    known = known_runtimes()
-    if runtime not in known:
-        raise typer.BadParameter(f"unknown runtime {runtime!r}; known: {', '.join(known)}")
-    roles: dict[Role, str] = {}
-    for item in role_runtime:
-        role_name, sep, name = item.partition("=")
-        if not sep or role_name not in Role.__members__.values() or name not in known:
+def _load() -> DevLoopConfig:
+    try:
+        return load_config()
+    except ConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _role_overrides(items: list[str], flag: str) -> dict[Role, str]:
+    overrides: dict[Role, str] = {}
+    for item in items:
+        role_name, sep, value = item.partition("=")
+        if not sep or role_name not in [r.value for r in Role] or not value:
             raise typer.BadParameter(
-                f"--role-runtime expects <role>=<runtime> with role in "
-                f"{', '.join(r.value for r in Role)} and runtime in {', '.join(known)}; "
-                f"got {item!r}"
+                f"{flag} expects <role>=<value> with role in "
+                f"{', '.join(r.value for r in Role)}; got {item!r}"
             )
-        roles[Role(role_name)] = name
-    return RuntimeConfig(default=runtime, model=model, roles=roles, agent_timeout_s=agent_timeout)
+        overrides[Role(role_name)] = value
+    return overrides
+
+
+def _apply_overrides(
+    config: DevLoopConfig,
+    *,
+    runtime: str | None,
+    model: str | None,
+    role_runtime: list[str],
+    role_model: list[str],
+    agent_timeout: int | None,
+) -> None:
+    runtimes = _role_overrides(role_runtime, "--role-runtime")
+    models = _role_overrides(role_model, "--role-model")
+    known = known_runtimes()
+    for role in Role:
+        agent = config.agents.for_role(role)
+        agent.runtime = runtimes.get(role) or runtime or agent.runtime
+        agent.model = models.get(role) or model or agent.model
+        agent.timeout_s = agent_timeout or agent.timeout_s
+        if agent.runtime not in known:
+            raise typer.BadParameter(
+                f"{role.value}: unknown runtime {agent.runtime!r}; known: {', '.join(known)}"
+            )
 
 
 @app.command()
 def run(
-    repo: Annotated[Path, typer.Option(help="Path to the target git repository")],
     task_file: Annotated[Path, typer.Option("--task", help="Markdown file describing the task")],
-    budget_usd: Annotated[float, typer.Option(help="Escalate once cost reaches this")] = (
-        BUDGET_USD_DEFAULT
-    ),
-    runtime: Annotated[
-        str, typer.Option(help="Agent CLI for every role: claude | opencode | stub")
-    ] = "claude",
-    model: Annotated[
-        str | None, typer.Option(help="Model passed to the agent CLI (e.g. sonnet, opus)")
+    repo: Annotated[
+        str | None,
+        typer.Option(help="Local path or clone URL (else DEVLOOP_REPO_URL / config repo.url)"),
     ] = None,
+    base_branch: Annotated[
+        str | None,
+        typer.Option(help="Branch to fork from (else DEVLOOP_BASE_BRANCH / config / default)"),
+    ] = None,
+    budget_usd: Annotated[
+        float | None, typer.Option(help="Escalate once cost reaches this (config: budget_usd)")
+    ] = None,
+    runtime: Annotated[
+        str | None, typer.Option(help="Agent CLI for every role: claude | opencode | stub")
+    ] = None,
+    model: Annotated[str | None, typer.Option(help="Model for every role (e.g. sonnet)")] = None,
     role_runtime: Annotated[
         list[str] | None,
-        typer.Option(help="Per-role override, repeatable: --role-runtime reviewer=opencode"),
+        typer.Option(help="Per-role runtime, repeatable: --role-runtime qa=opencode"),
+    ] = None,
+    role_model: Annotated[
+        list[str] | None,
+        typer.Option(help="Per-role model, repeatable: --role-model engineer=opus"),
     ] = None,
     agent_timeout: Annotated[
         int | None,
-        typer.Option(
-            help="Seconds each agent run may take, for every role (defaults: 10-30 min by role)",
-            min=60,
-        ),
+        typer.Option(help="Seconds each agent run may take, for every role", min=60),
+    ] = None,
+    pr: Annotated[
+        bool | None, typer.Option("--pr/--no-pr", help="Open a PR when the repo is on GitHub")
     ] = None,
 ) -> None:
     """Start a new task and drive it to a human gate or completion."""
 
     if not task_file.exists():
         raise typer.BadParameter(f"task file not found: {task_file}")
+    config = _load()
+    _apply_overrides(
+        config,
+        runtime=runtime,
+        model=model,
+        role_runtime=role_runtime or [],
+        role_model=role_model or [],
+        agent_timeout=agent_timeout,
+    )
+    source = repo or config.repo.url
+    if not source:
+        raise typer.BadParameter("no repo: pass --repo, set DEVLOOP_REPO_URL, or set repo.url")
+    if pr is not None:
+        config.pull_request.enabled = pr
+    _preflight(config)
     _setup_logging()
-    runtime_config = _runtime_config(runtime, model, role_runtime or [], agent_timeout)
 
     title = task_file.stem.replace("-", " ").replace("_", " ")
     task_id = uuid.uuid4().hex[:8]
     task = TaskInput(
         external_id=task_id,
         source="local",
-        repo_path=str(repo.resolve()),
+        repo=str(Path(source).resolve()) if Path(source).exists() else source,
+        base_branch=base_branch or config.repo.base_branch,
         title=title,
         description=task_file.read_text(),
     )
 
     graph = build_graph(checkpointer=checkpointer())
-    config = {"configurable": {"thread_id": task_id}}
-    initial: DevLoopState = {
-        "task": task,
-        "status": DevLoopStatus.RECEIVED,
-        "runtime": runtime_config,
-        "iteration": 0,
-        "replan_count": 0,
-        "cost_usd": 0.0,
-        "budget_usd": budget_usd,
-        "baseline": [],
-        "verification": [],
-        "feedback": [],
-        "agent_runs": [],
-    }
+    thread = {"configurable": {"thread_id": task_id}}
+    initial = new_task_state(task, config, budget_usd=budget_usd)
 
+    team = "\n".join(
+        f"  {role.value:<14} {a.runtime}" + (f" · {a.model}" if a.model else "")
+        for role in Role
+        for a in [config.agents.for_role(role)]
+    )
     rprint(
         Panel(
             f"task [bold]{task_id}[/bold]: {title}\n"
-            f"repo: {task.repo_path}\n"
-            f"runtime: {runtime}" + (f" ({model})" if model else "")
+            f"repo: {task.repo}" + (f" @ {task.base_branch}" if task.base_branch else "") + "\n"
+            f"team:\n{team}"
         )
     )
-    _drive(graph, initial, config, task_id)
+    _drive(graph, initial, thread, task_id)
+
+
+def _team_pairs(config: DevLoopConfig) -> dict[tuple[str, str | None], list[str]]:
+    """Distinct (runtime, model) pairs on the team, with the roles using each."""
+
+    pairs: dict[tuple[str, str | None], list[str]] = {}
+    for role in Role:
+        agent = config.agents.for_role(role)
+        pairs.setdefault((agent.runtime, agent.model), []).append(role.value)
+    return pairs
+
+
+def _preflight(config: DevLoopConfig) -> None:
+    """Fail before cloning anything if a model id can't possibly work."""
+
+    problems = [
+        f"{', '.join(roles)}: {problem}"
+        for (runtime, model), roles in _team_pairs(config).items()
+        if (problem := check_model(runtime, model))
+    ]
+    if problems:
+        raise typer.BadParameter("\n".join(problems))
+
+
+@app.command()
+def probe(
+    runtime: Annotated[
+        str | None, typer.Option(help="Probe this runtime instead of the configured team")
+    ] = None,
+    model: Annotated[
+        list[str] | None, typer.Option(help="Model to probe, repeatable (needs --runtime)")
+    ] = None,
+    timeout: Annotated[int, typer.Option(help="Seconds per probe", min=30)] = 600,
+) -> None:
+    """Check each runtime/model can do a DevLoop step: read the context
+    file, write a JSON document with a file tool. One tiny real run each."""
+
+    pairs: dict[tuple[str, str | None], list[str]]
+    if runtime:
+        models: list[str | None] = list(model) if model else [None]
+        pairs = {(runtime, m): ["--model"] for m in models}
+    else:
+        pairs = _team_pairs(_load())
+    rprint(f"probing {len(pairs)} runtime/model pair(s), in parallel …")
+    with ThreadPoolExecutor(max_workers=len(pairs)) as pool:
+        futures = {
+            pool.submit(run_probe, rt, m, timeout_s=timeout): roles
+            for (rt, m), roles in pairs.items()
+        }
+        results = [(f.result(), roles) for f, roles in futures.items()]
+
+    table = Table("runtime", "model", "used by", "result", "time", "cost $")
+    for result, roles in sorted(results, key=lambda r: (not r[0].ok, r[0].seconds)):
+        table.add_row(
+            result.runtime,
+            result.model or "(default)",
+            ", ".join(roles),
+            "[green]✓ works[/green]" if result.ok else f"[red]✗[/red] {result.error[:70]}",
+            f"{result.seconds:.0f}s",
+            f"{result.cost_usd:.4f}",
+        )
+    rprint(table)
+    if not all(r.ok for r, _ in results):
+        raise typer.Exit(1)
+
+
+@app.command("config")
+def show_config() -> None:
+    """Print the effective configuration and where it came from."""
+
+    path = config_path()
+    rprint(f"[dim]config file: {path or '(none — defaults)'}[/dim]")
+    rprint(yaml.safe_dump(_load().model_dump(mode="json"), sort_keys=False))
 
 
 @app.command()
@@ -158,6 +280,7 @@ def show(task_id: Annotated[str, typer.Argument(help="Task id printed by `devloo
     rprint(
         Panel(
             f"status: [bold]{values.get('status')}[/bold]\n"
+            f"pull request: {values.get('pull_request_url') or '—'}\n"
             f"branch: {values.get('branch')}  base: {(values.get('base_commit') or '')[:10]}\n"
             f"iteration: {values.get('iteration')}  replans: {values.get('replan_count')}\n"
             f"cost: ${values.get('cost_usd', 0.0):.4f} of ${values.get('budget_usd') or 0:.2f}\n"
@@ -170,10 +293,10 @@ def show(task_id: Annotated[str, typer.Argument(help="Task id printed by `devloo
             title=f"task {task_id}",
         )
     )
-    table = Table("role", "iter", "try", "runtime", "prompt", "ok", "cost $", "tokens in/out", "s")
+    table = Table("step", "iter", "try", "runtime", "prompt", "ok", "cost $", "tokens in/out", "s")
     for r in values.get("agent_runs", []):
         table.add_row(
-            r.role.value,
+            r.step.value + (" ↻" if r.resumed else ""),
             str(r.iteration),
             str(r.attempt),
             r.runtime,

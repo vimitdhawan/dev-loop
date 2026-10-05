@@ -12,8 +12,12 @@ from pathlib import Path, PurePosixPath
 
 from devloop.contracts.artifacts import (
     FileAction,
+    Finding,
     ImplementationResult,
     PlanResult,
+    POAnswer,
+    QAResult,
+    QAVerdict,
     RequirementResult,
     ReviewResult,
 )
@@ -23,6 +27,8 @@ _FORBIDDEN_ROOTS = {".git", ".devloop"}
 
 
 def check_plan(plan: PlanResult, workspace: Path) -> list[str]:
+    if plan.questions_for_po:
+        return []  # the plan is on hold until the questions are answered
     problems: list[str] = []
     if not plan.files_to_change:
         problems.append("files_to_change is empty; a plan must name at least one file")
@@ -65,12 +71,37 @@ def check_requirements(req: RequirementResult) -> list[str]:
     return []
 
 
+def _duplicate_ids(findings: list[Finding]) -> list[str]:
+    dupes = [i for i, n in Counter(f.id for f in findings).items() if n > 1]
+    return [f"finding ids must be unique; duplicated: {', '.join(dupes)}"] if dupes else []
+
+
 def check_review(review: ReviewResult) -> list[str]:
-    dupes = [i for i, n in Counter(f.id for f in review.findings).items() if n > 1]
-    if dupes:
-        return [f"finding ids must be unique; duplicated: {', '.join(dupes)}"]
     if review.verdict.value == "changes_requested" and not review.findings:
         return ["verdict is changes_requested but there are no findings to act on"]
+    return _duplicate_ids(review.findings)
+
+
+def check_qa(qa: QAResult) -> list[str]:
+    if qa.verdict == QAVerdict.SKIPPED:
+        return ["verdict 'skipped' is set by the orchestrator, not by QA"]
+    if qa.verdict == QAVerdict.FAILED and not qa.findings:
+        return ["verdict is failed but there are no findings describing the bugs"]
+    if qa.verdict == QAVerdict.BLOCKED and not qa.notes:
+        return ["verdict is blocked but notes don't say what blocked testing"]
+    if qa.verdict != QAVerdict.BLOCKED and not qa.scenarios:
+        return ["no scenarios: test every acceptance criterion and record each one"]
+    return _duplicate_ids(qa.findings)
+
+
+def check_po_answer(answer: POAnswer, questions: list[str]) -> list[str]:
+    covered = {a.question for a in answer.answers} | set(answer.needs_human)
+    missing = [q for q in questions if q not in covered]
+    if missing:
+        return [
+            "every question must appear verbatim in answers[].question or needs_human; "
+            f"missing: {missing}"
+        ]
     return []
 
 

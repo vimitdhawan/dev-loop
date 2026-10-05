@@ -8,10 +8,11 @@ Architecture context lives in [`architecture.md`](./architecture.md).
 | **0** | Walking skeleton — state machine, contracts, graph, local CLI | ✅ **Done** |
 | **1** | Sandbox + environment bootstrap | 🟡 Partial — per-task clone, `devloop.yml`, host-run baseline; Docker ⬜ |
 | **2** | Real agents (Reviewer → Planner → Requirement → Developer) | ✅ **Done** |
-| **3** | Human loop (clarify Q&A, scoped feedback, escalation) | ⬜ |
-| **4** | Knowledge base | ⬜ |
-| **5** | Hardening + telemetry | ⬜ |
-| **v1** | GitHub adapter | ⬜ |
+| **3** | Agent team — PO / Engineer / QA / Reviewer, sessions, config, clone + PR | ✅ **Done** |
+| **4** | Human loop (scoped feedback, PR review comments, retry from escalation) | ⬜ Next |
+| **5** | Knowledge base | ⬜ |
+| **6** | Hardening + telemetry | ⬜ |
+| **v1** | GitHub App (webhooks, issues as tasks) | 🟡 PR sink done in Phase 3 |
 | **v2** | Improvement engine | ⬜ |
 
 ---
@@ -358,27 +359,158 @@ Found by running real models:
 
 ## Known gaps → later phases
 
-- Crash-resume of an agent node re-runs the agent (double spend) — Phase 5.
-- Human feedback findings are never marked resolved — Phase 3 (`devloop feedback`).
-- `escalate` can only `cancel`; retry-from-here is Phase 3.
+- Crash-resume of an agent node re-runs the agent (double spend) — Phase 6.
+- Human feedback findings are never marked resolved — Phase 4 (`devloop feedback`).
+- `escalate` can only `cancel`; retry-from-here is Phase 4.
 - The Reviewer occasionally cites line numbers beyond the file's length;
   a cheap deterministic check is a candidate addition.
 
 ---
 
-# Phase 3 — Human loop ⬜
+# Phase 3 — Agent team ✅
 
-- `clarify` interrupt with real terminal Q&A, answers folded into
-  `acceptance_criteria`
-- `devloop feedback` mapping free text to `Finding` objects
-- Scoped feedback — re-open one finding, not the whole change
-- `ESCALATED` surfaced with the reason and the capability gap
-- Requirements + plan + deviations + evidence written to `.devloop/` alongside
-  the branch, so the plan is reviewable
+**Goal:** stop treating agents as isolated functions and run them as a
+development team — with the same audit trail and gates as before.
+
+```
+Product Owner ──► Engineer: plan ──► plan check ──► Engineer: implement
+     ▲  answers  │ questions                          │ questions
+     └───────────┴────────────────────────────────────┘
+implement ──► checks ──► QA (browser) ──► Reviewer (fresh) ──► push + PR ──► ⏸ human
+    ▲            │ red        │ bugs            │ changes
+    └────────────┴────────────┴─────────────────┘
+```
+
+| Role | Steps | Session | Default timeout |
+|---|---|---|---|
+| **Product Owner** | requirements; answers the Engineer's questions | kept for the task | 10 min |
+| **Engineer** | plan → implement → fix (unit + integration tests included) | **one session** for all three | 15 / 30 min |
+| **QA** | black-box test of the running app via Playwright MCP | kept across retests | 20 min |
+| **Reviewer** | code review; **final approver** | **fresh every time** | 15 min |
+
+## Design decisions
+
+- **Plan and implement share a session but stay two steps.** The plan is
+  checked deterministically (files exist, scope sane) *between* them, and
+  it stays the human's review surface. One fused "plan and build" run
+  would turn a bad plan straight into code with no gate.
+- **Agents never talk directly.** A question is a field
+  (`questions_for_po`) in the Engineer's output. The orchestrator routes it
+  to the Product Owner's session, which answers or defers to a human
+  (`needs_human` → the `clarify` gate). Capped at 3 consultations. Every
+  hand-off is a stored `Clarification`, so it's replayable and evaluable.
+- **A session is an optimisation, never the source of truth.** The context
+  file is rewritten in full on every call, so a step behaves the same if a
+  session is lost or a runtime has none. Measured gain on a small repo was
+  modest (~20s/step); the bigger win is the Engineer remembering *why* it
+  planned something when it fixes a review comment.
+- **One repair path.** QA bugs and app-start failures are `Finding`s
+  (`source: qa | orchestrator`), exactly like review comments.
+- **The orchestrator runs the app, not QA** (`env/app.py`): setup hooks →
+  start → wait for the URL → QA → stop → teardown. A port already in use or
+  a failing setup hook escalates (not the change's fault); an app that
+  won't start goes back to the Engineer as a P0 finding.
+- **The Reviewer always starts fresh** but gets `prior_findings` and QA's
+  report, so it checks that earlier comments were actually fixed.
+- **Only Reviewer approval (after QA passes or is skipped) publishes.**
+
+## What was built
+
+| Area | Files |
+|---|---|
+| Team contracts | `contracts/runs.py` (`Role`, `Step`, `TeamConfig`, `AgentConfig`), `artifacts.py` (`POAnswer`, `Clarification`, `QAResult`, `AppSpec`, `questions_for_po`) |
+| Statuses | `CONSULTING_PO`, `QA_TESTING`, `PUBLISHING` |
+| Config | `config.py`, `devloop.config.example.yaml` — per-role runtime/model/timeout, repo source, PR, budget; strict (unknown keys fail) |
+| Sessions | `runtimes/claude_cli.py` (`--resume`), `opencode_cli.py` (`--session`); repair retries resume too, with a short prompt |
+| QA | `agents/roles.py` (Playwright MCP, headless + isolated), `env/app.py`, `prompts/qa/v1.md` |
+| Source | `sandbox/workspace.py` — fresh clone from a path, bare repo or URL, any base branch; `devloop/<id>-<slug>` branches |
+| Sink | `sink/summary.py` (PR body: requirements, clarifications, plan, deviations, checks, QA, review), `sink/github.py` (`gh pr create`/`edit`, idempotent) |
+| CLI | `devloop config`; `run --repo <path\|url> --base-branch --role-model --role-runtime --pr/--no-pr` |
+
+## Verified
+
+- 194 tests (no model calls): routing table (66 cases), and end-to-end graph
+  runs for — Engineer keeps one session across plan/implement/fix; Reviewer
+  never resumes; PO answers in its own session; PO defers to a human and the
+  task returns to the step that asked (without counting an attempt); QA bug
+  → fix → QA retests in its session; app that won't start → Engineer;
+  fresh clone from a URL → branch pushed → PR via (fake) `gh`; PR disabled.
+- **Real run** (Claude, Sonnet for all roles) on a small static web app:
+  PO → plan → implement (resumed session) → `node --test` → **QA drove the
+  page in headless Chromium: 8 scenarios incl. keyboard-only and a 320px
+  viewport, 3 screenshots** → fresh review → published. **$0.48**, ~2 min.
+
+## Bugs found on the way
+
+- A local **bare** repo was rejected as "not a git repository" (the check
+  looked for `.git/`).
+- Unknown config keys were silently ignored — `enginer:` would have run the
+  default team. Config models now forbid extra keys.
+- PR body ticked every acceptance criterion `[x]`, claiming verification
+  nobody performed; the QA/check sections are the evidence now.
+- `duration_ms` was 0 for runtimes that don't report it (opencode); the
+  harness now measures wall time.
+
+## Added after first use
+
+- **Model id preflight.** A first real run with opencode failed in 1 s with
+  `UnknownError: Unexpected server error` — the config said
+  `meta/muse-glimmer-30b`, opencode wants `provider/model`
+  (`nvidia/meta/muse-glimmer-30b`) and read `meta` as the provider.
+  `devloop run` now checks opencode ids against `opencode models` before
+  cloning anything and suggests the right one.
+- **`devloop probe`.** One tiny real run per runtime/model through the exact
+  file contract the agents use, in parallel; reports works / fails and why
+  (no output → no tool calling; wrong word → ignored the context file).
+- **LangGraph Studio.** `langgraph.json` + `graph/studio.py` export the same
+  graph; `ingest` accepts raw JSON input (`{"task": {"title", "description"}}`)
+  and fills the rest from `devloop.config.yaml` via `graph/inputs.py`, which
+  the CLI now uses too. Verified against `langgraph dev` 0.15: a stub-team
+  task ran end to end (QA app included), paused at `finalize`, and resumed
+  through the API to `FINALIZED`.
+
+### Probe results — NVIDIA free tier via opencode, 2026-10-05
+
+12 models probed in parallel, 900 s limit each. One sample per model, on a
+shared free tier — queue times vary by hour, so re-probe before relying on it.
+
+| Model | Result | Time |
+|---|---|---|
+| `nvidia/nvidia/nemotron-3-super-120b-a12b` | ✓ | 18 s |
+| `nvidia/openai/gpt-oss-20b` | ✓ | 19 s |
+| `nvidia/nvidia/nemotron-3-ultra-550b-a55b` | ✓ | 21 s |
+| `nvidia/poolside/laguna-xs-2.1` | ✓ | 150 s |
+| `nvidia/z-ai/glm-5.3` | ✗ ran, but never wrote the file | 634 s |
+| `nvidia/mistralai/mistral-medium-3-instruct` | ✗ 404 from the provider | 11 s |
+| `nvidia/meta/muse-glimmer-30b`, `kimi-k3`, `deepseek-v4.1-flash`, `gemma-4-31b-it`, `glm-5.3-flash` | ✗ timed out | 900 s |
+| `meta/muse-glimmer-30b` (no provider) | ✗ caught by the preflight, no run | 0 s |
+
+A probe proves the mechanics (model id, tool calling, following the
+contract), not coding ability — confirm a candidate on a small real task.
+
+## Not done → next
+
+- Real GitHub PR not exercised against github.com here (only a fake `gh`);
+  first real run should be on a throwaway repo.
+- QA for non-web repos (CLI/API acceptance testing) — currently skipped.
+- Engineer-asks-PO verified with stubs only; no real run happened to
+  produce a question.
 
 ---
 
-# Phase 4 — Knowledge base ⬜
+# Phase 4 — Human loop ⬜
+
+- `devloop feedback` mapping free text to `Finding` objects
+- Scoped feedback — re-open one finding, not the whole change
+- PR review comments → scoped `Finding` → same repair path (with the GitHub App)
+- Retry from `ESCALATED` (today it can only be cancelled)
+
+*(Clarify Q&A folded into requirements, escalation reasons, and the
+reviewable requirements/plan/evidence summary landed in Phases 2–3.)*
+
+---
+
+# Phase 5 — Knowledge base ⬜
 
 - `repo_knowledge` store with confidence, provenance, decay
 - `harvest_knowledge` node after every task
@@ -388,7 +520,7 @@ Found by running real models:
 
 ---
 
-# Phase 5 — Hardening + telemetry ⬜
+# Phase 6 — Hardening + telemetry ⬜
 
 - Budget and iteration enforcement under real cost accounting
 - Retry/backoff on CLI failures
@@ -404,7 +536,7 @@ duplicate branch, no duplicate agent run. Repeat for `clarify` and `finalize`.
 
 ---
 
-# v1 — GitHub adapter ⬜
+# v1 — GitHub App 🟡
 
 The core graph does not change. Only `sources/` and the sink.
 
@@ -415,8 +547,8 @@ The core graph does not change. Only `sources/` and the sink.
 - Events: `issues`, `issue_comment`, `pull_request`,
   `pull_request_review`, `pull_request_review_comment`, `workflow_run`
 - Issue-comment requirement Q&A
-- PR creation with **plan as the PR body**, pinned status comment updated on
-  every transition
+- ~~PR creation with **plan as the PR body**~~ (done in Phase 3 via `gh`);
+  pinned status comment updated on every transition
 - PR review comments → scoped `Finding` → same repair path
 
 ---

@@ -11,6 +11,13 @@ can't read needs a `devloop.yml`, and the task escalates saying so.
     commands:          # name -> command; the name becomes TestRunResult.type
       lint: uv run ruff check .
       unit: uv run pytest -q
+    app:               # optional; enables browser QA
+      start: npm run dev -- -p 3100
+      url: http://localhost:3100
+      ready_timeout_s: 120
+      env: {NEXT_PUBLIC_API_URL: http://localhost:8080}
+      setup: [supabase start]       # before start
+      teardown: [supabase stop]     # after the app is stopped
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from devloop.contracts.artifacts import EnvRecipe
+from devloop.contracts.artifacts import AppSpec, EnvRecipe
 from devloop.errors import EnvError
 
 HOST_IMAGE = "host"
@@ -31,6 +38,7 @@ HOST_IMAGE = "host"
 class DevloopYml(BaseModel):
     setup: list[str] = Field(default_factory=list)
     commands: dict[str, str] = Field(default_factory=dict)
+    app: AppSpec | None = None
 
     @field_validator("setup", "commands", mode="before")
     @classmethod
@@ -60,7 +68,9 @@ def discover_recipe(workspace: Path, base_commit: str) -> EnvRecipe | None:
             parsed = DevloopYml.model_validate(raw)
         except (yaml.YAMLError, ValidationError) as exc:
             raise EnvError(f"invalid devloop.yml: {exc}") from exc
-        return _recipe(parsed.setup, parsed.commands, base_commit)
+        recipe = _recipe(parsed.setup, parsed.commands, base_commit)
+        recipe.app = parsed.app
+        return recipe
 
     detected = _heuristic(workspace)
     if detected is None:

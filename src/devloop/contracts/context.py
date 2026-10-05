@@ -10,14 +10,16 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from devloop.contracts.artifacts import (
+    Clarification,
     Deviation,
     Finding,
     FindingDispute,
     PlanInvalidation,
     PlanResult,
+    QAResult,
     RequirementResult,
 )
-from devloop.contracts.runs import Role
+from devloop.contracts.runs import Role, Step
 from devloop.contracts.state import TaskInput
 
 
@@ -35,12 +37,17 @@ class VerificationSummary(BaseModel):
 
 class DevelopmentContext(BaseModel):
     role: Role
+    step: Step
     task: TaskInput
     iteration: int
     base_commit: str
     branch: str
 
     requirements: RequirementResult | None = None
+    # Every question asked during the task and its answer (PO's or a human's).
+    clarifications: list[Clarification] = Field(default_factory=list)
+    # For the Product Owner: the Engineer's questions to answer now.
+    questions: list[str] = Field(default_factory=list)
     plan: PlanResult | None = None
     # Why the previous plan was thrown away, so the next one doesn't repeat it.
     replan_reason: str | None = None
@@ -54,5 +61,12 @@ class DevelopmentContext(BaseModel):
     # Commands the orchestrator will run to verify; the Developer may run
     # these for its own feedback, but only the orchestrator's runs count.
     commands: dict[str, str] = Field(default_factory=dict)
-    # For the Reviewer: path (relative to the workspace) of the full diff.
+    # For QA and the Reviewer: the findings this attempt was meant to fix.
+    prior_findings: list[Finding] = Field(default_factory=list)
+    # For QA: where the orchestrator is serving the app, and where to save
+    # screenshots (both relative to the workspace).
+    app_url: str | None = None
+    evidence_dir: str | None = None
+    # For the Reviewer: QA's report on this change, and the full diff.
+    qa: QAResult | None = None
     diff_path: str | None = None

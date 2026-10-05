@@ -1,10 +1,11 @@
 """Per-task workspace: a private clone of the target repo.
 
-Agents never touch the user's checkout. Each task gets
-`~/.devloop/work/<task_id>`, cloned from the target repo's base branch, on
-a `devloop/<task_id>` branch. The orchestrator — never an agent — commits,
-and publishes the branch back to the target repo so a human can inspect it
-with plain `git log -p` while the task waits at the merge gate.
+Agents never touch the user's checkout. Each task gets a fresh clone at
+`~/.devloop/work/<task_id>` — from a local path or a remote URL, of the
+base branch the user chose (or the repo's default) — on a
+`devloop/<task_id>-<slug>` branch. The orchestrator — never an agent —
+commits, and publishes the branch to `origin` (the local repo, or GitHub)
+once the change is approved.
 
 This is the same `/workspace` layout the Docker sandbox will bind-mount,
 so moving execution into a container changes how commands are *run*, not
@@ -17,6 +18,7 @@ branch force-updates it to the same commit.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,28 +73,47 @@ def default_branch(repo_path: Path) -> str:
     )
 
 
-def prepare_workspace(source_repo: Path, task_id: str) -> Workspace:
-    branch = f"devloop/{task_id}"
+def branch_name(task_id: str, title: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40].rstrip("-")
+    return f"devloop/{task_id}-{slug}" if slug else f"devloop/{task_id}"
+
+
+def prepare_workspace(
+    source: str, task_id: str, *, branch: str, base_branch: str | None = None
+) -> tuple[Workspace, str]:
+    """Clone `source` (a path or a URL) at `base_branch` and create the task
+    branch. Returns the workspace and the base branch actually used.
+    Idempotent: an existing workspace for the task is reused as is."""
+
     path = workspace_dir(task_id)
-
     if (path / ".git").exists():
-        return Workspace(path=path, base_commit=_git(path, "rev-parse", _BASE_REF), branch=branch)
+        base = _git(path, "config", "--get", "devloop.base-branch")
+        workspace = Workspace(
+            path=path, base_commit=_git(path, "rev-parse", _BASE_REF), branch=branch
+        )
+        return workspace, base
 
-    if not (source_repo / ".git").exists():
-        raise GitError(f"{source_repo} is not a git repository")
+    local = Path(source).expanduser()
+    if local.exists():
+        if not _is_git_repo(local):
+            raise GitError(f"{local} is not a git repository")
+        source = str(local.resolve())
+        base_branch = base_branch or default_branch(local)
 
-    base = default_branch(source_repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["git", "clone", "--quiet", "--branch", base, str(source_repo), str(path)],
-        capture_output=True,
-        text=True,
-    )
+    clone = ["git", "clone", "--quiet"]
+    if base_branch:
+        clone += ["--branch", base_branch]
+    result = subprocess.run([*clone, source, str(path)], capture_output=True, text=True)
     if result.returncode != 0:
-        raise GitError(f"git clone {source_repo} failed: {result.stderr.strip()}")
+        raise GitError(f"git clone {source} failed: {result.stderr.strip()}")
 
+    base = base_branch or _git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    if base.startswith("devloop/"):
+        raise GitError(f"refusing to fork a task from another task's branch ({base})")
     base_commit = _git(path, "rev-parse", "HEAD")
     _git(path, "update-ref", _BASE_REF, base_commit)
+    _git(path, "config", "devloop.base-branch", base)
     _git(path, "checkout", "--quiet", "-b", branch)
     _git(path, "config", "user.name", _BOT_NAME)
     _git(path, "config", "user.email", _BOT_EMAIL)
@@ -101,7 +122,27 @@ def prepare_workspace(source_repo: Path, task_id: str) -> Workspace:
     exclude.parent.mkdir(parents=True, exist_ok=True)
     with exclude.open("a") as fh:
         fh.write("\n.devloop/\n")
-    return Workspace(path=path, base_commit=base_commit, branch=branch)
+    return Workspace(path=path, base_commit=base_commit, branch=branch), base
+
+
+def _is_git_repo(path: Path) -> bool:
+    """True for a working copy *or* a bare repo (e.g. a local mirror)."""
+
+    probe = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--git-dir"], capture_output=True, text=True
+    )
+    return probe.returncode == 0
+
+
+def origin_url(path: Path) -> str:
+    return _git(path, "remote", "get-url", "origin")
+
+
+def github_slug(url: str) -> str | None:
+    """`owner/repo` for a GitHub remote (https or ssh), else None."""
+
+    match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    return f"{match.group(1)}/{match.group(2)}" if match else None
 
 
 def is_dirty(path: Path) -> bool:
@@ -147,7 +188,7 @@ def diff_patch(path: Path, base_commit: str) -> str:
 
 
 def publish_branch(path: Path, branch: str) -> None:
-    """Make the task branch visible in the user's repo. Force is safe: the
-    `devloop/<task_id>` branch is owned by exactly this task."""
+    """Push the task branch to `origin`. Force is safe: the
+    `devloop/<task_id>-*` branch is owned by exactly this task."""
 
     _git(path, "push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{branch}")
