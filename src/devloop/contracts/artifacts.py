@@ -31,6 +31,44 @@ class RequirementResult(BaseModel):
     questions: list[str] = Field(default_factory=list)
 
 
+class ScreenDesign(BaseModel):
+    """One screen or component the change adds or alters, specified well
+    enough to build and to test against."""
+
+    name: str
+    purpose: str
+    # layout and components, top to bottom, in words
+    layout: list[str] = Field(default_factory=list)
+    # e.g. "empty: shows 'No players yet' and an Add button"
+    states: list[str] = Field(default_factory=list)
+    interactions: list[str] = Field(default_factory=list)
+    # existing components/files to reuse, so the plan builds on what's there
+    reuse: list[str] = Field(default_factory=list)
+
+
+class DesignReference(BaseModel):
+    """A design made with a tool, e.g. a Stitch screen. `ref` is whatever
+    finds it again: a project/screen id, a URL, a path under `.devloop/`."""
+
+    tool: str  # "stitch" | "file" | "url" | ...
+    ref: str
+    description: str = ""
+
+
+class DesignResult(BaseModel):
+    """The UX stage's hand-off to the Planner. Text first — every later
+    agent reads it — with tool-made designs as references alongside."""
+
+    summary: str
+    screens: list[ScreenDesign] = Field(default_factory=list)
+    # visual decisions: spacing, colour tokens, typography, copy tone
+    guidelines: list[str] = Field(default_factory=list)
+    accessibility: list[str] = Field(default_factory=list)
+    references: list[DesignReference] = Field(default_factory=list)
+    # Non-empty: UX can't design without answers; they go to the Product Owner.
+    questions_for_po: list[str] = Field(default_factory=list)
+
+
 class FileAction(StrEnum):
     MODIFY = "modify"
     CREATE = "create"

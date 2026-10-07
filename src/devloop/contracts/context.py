@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from devloop.contracts.artifacts import (
     Clarification,
+    DesignResult,
     Deviation,
     Finding,
     FindingDispute,
@@ -19,7 +20,7 @@ from devloop.contracts.artifacts import (
     QAResult,
     RequirementResult,
 )
-from devloop.contracts.runs import Role, Step
+from devloop.contracts.runs import Role, Step, Workflow
 from devloop.contracts.state import TaskInput
 
 
@@ -42,12 +43,17 @@ class DevelopmentContext(BaseModel):
     iteration: int
     base_commit: str
     branch: str
+    # The stages this task goes through. A workflow without a Product Owner
+    # (e.g. a bug fix) has no `requirements`: the task itself is the spec.
+    workflow: Workflow | None = None
 
     requirements: RequirementResult | None = None
     # Every question asked during the task and its answer (PO's or a human's).
     clarifications: list[Clarification] = Field(default_factory=list)
     # For the Product Owner: the Engineer's questions to answer now.
     questions: list[str] = Field(default_factory=list)
+    # The UX stage's screens and guidelines, for UI workflows.
+    design: DesignResult | None = None
     plan: PlanResult | None = None
     # Why the previous plan was thrown away, so the next one doesn't repeat it.
     replan_reason: str | None = None

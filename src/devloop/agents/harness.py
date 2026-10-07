@@ -9,6 +9,11 @@
 5. On a validation problem, retry **exactly once** in the same session,
    feeding the problems back. Then give up.
 
+Every attempt is also kept in `tasks/<id>/runs/NNN-<step>-a<n>/` —
+`context.json` (exactly what the agent was handed), `prompt.md` and
+`output.json` (exactly what it wrote) — so a hand-off between two agents
+can be inspected, replayed or evaluated later.
+
 A crash, timeout or a read-only step touching the workspace is not
 repaired — those aren't output-format problems, and retrying them just
 spends money. Every attempt, failed or not, becomes an `AgentRunRecord`.
@@ -22,9 +27,10 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
@@ -34,7 +40,14 @@ from devloop.contracts.context import DevelopmentContext
 from devloop.contracts.runs import AgentConfig, AgentRunRecord, Role, Step
 from devloop.errors import AgentError
 from devloop.paths import task_dir
-from devloop.runtimes.base import IN_DIR, OUT_DIR, AgentInvocation, AgentOutcome, ToolPolicy
+from devloop.runtimes.base import (
+    IN_DIR,
+    OUT_DIR,
+    AgentInvocation,
+    AgentOutcome,
+    ToolPolicy,
+    resolve_mcp,
+)
 from devloop.runtimes.registry import get_runtime
 from devloop.sandbox.workspace import discard_changes, is_dirty
 
@@ -98,6 +111,11 @@ def run_step[T: BaseModel](
     )
     agent = get_runtime(agent_config.runtime)
     result: StepRun[T] = StepRun(session_id=session_id)
+    try:
+        tools = _with_configured_mcp(spec.tools, agent_config)
+    except AgentError as exc:
+        result.error = f"{spec.step.value}: {exc}"
+        return result
     text = _RESUMED_PREFIX + base_text if session_id else base_text
     problems: list[str] = []
 
@@ -106,13 +124,16 @@ def run_step[T: BaseModel](
         log_path = (
             task_dir(task_id) / "logs" / f"{spec.step.value}-i{context.iteration}-a{attempt}.log"
         )
+        run_dir = _new_run_dir(task_id, f"{spec.step.value}-a{attempt}")
+        shutil.copyfile(in_dir / "context.json", run_dir / "context.json")
+        (run_dir / "prompt.md").write_text(text)
         budget = None if budget_left_usd is None else max(budget_left_usd - result.cost_usd, 0.0)
         invocation = AgentInvocation(
             role=spec.role,
             step=spec.step,
             prompt=text,
             workdir=workspace,
-            tools=spec.tools,
+            tools=tools,
             log_path=log_path,
             model=agent_config.model,
             max_budget_usd=budget,
@@ -120,7 +141,8 @@ def run_step[T: BaseModel](
             resume_session=result.session_id,
         )
         log.info(
-            "%s/%s (%s, attempt %d%s) — log: %s",
+            "[%s] %s/%s (%s, attempt %d%s) — log: %s",
+            task_id,
             spec.role.value,
             spec.step.value,
             agent.name,
@@ -145,6 +167,8 @@ def run_step[T: BaseModel](
             fatal = True
         if not fatal:
             artifact, problems = _validate(out_file, spec.contract, check)
+        if out_file.exists():
+            shutil.copyfile(out_file, run_dir / "output.json")
 
         error = outcome.error if fatal else "; ".join(problems)
         record = AgentRunRecord(
@@ -165,6 +189,7 @@ def run_step[T: BaseModel](
             session_id=outcome.session_id,
             resumed=invocation.resume_session is not None,
             log_path=str(log_path),
+            run_dir=str(run_dir),
         )
         result.records.append(record)
         _append_jsonl(task_dir(task_id) / "agent_runs.jsonl", record)
@@ -182,6 +207,26 @@ def run_step[T: BaseModel](
 
     result.error = f"{spec.step.value} output still invalid after repair: {'; '.join(problems)}"
     return result
+
+
+def _with_configured_mcp(tools: ToolPolicy, agent_config: AgentConfig) -> ToolPolicy:
+    """The step's own MCP servers plus the ones configured for the role."""
+
+    if not agent_config.mcp_servers:
+        return tools
+    own = {s.name for s in tools.mcp_servers}
+    extra = tuple(
+        resolve_mcp(name, cfg) for name, cfg in agent_config.mcp_servers.items() if name not in own
+    )
+    return replace(tools, mcp_servers=(*tools.mcp_servers, *extra))
+
+
+def _new_run_dir(task_id: str, name: str) -> Path:
+    runs = task_dir(task_id) / "runs"
+    runs.mkdir(exist_ok=True)
+    path = runs / f"{len(list(runs.iterdir())) + 1:03d}-{name}"
+    path.mkdir()
+    return path
 
 
 def _validate[T: BaseModel](

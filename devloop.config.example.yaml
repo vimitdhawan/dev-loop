@@ -3,13 +3,29 @@
 # Precedence: CLI flag > environment variable > this file > default.
 
 # The agent team. runtime: claude | opencode | stub. model: whatever the
-# runtime accepts (claude: sonnet, opus, haiku or a full id). timeout_s:
-# seconds per agent run (default: 10-30 min depending on the step).
+# runtime accepts (claude: sonnet, opus, haiku or a full id; opencode:
+# provider/model — see `opencode models`). timeout_s: seconds per agent run
+# (default: 10-30 min depending on the step).
 agents:
-  product_owner:          # writes requirements, answers the Engineer's questions
+  product_owner:          # writes requirements, answers the team's questions
     runtime: claude
     model: sonnet
-  engineer:               # plans and implements in ONE session — one runtime/model
+  ux:                     # designs UI changes (ui_feature workflow). Unset = runs as product_owner
+    runtime: claude
+    model: sonnet
+    # Design tools for this role only. Remote (url) or local (command) MCP
+    # servers; ${VAR} in a header is read from the environment at launch,
+    # so the key never sits in this file. Check the Stitch docs for the
+    # current endpoint and header.
+    mcp_servers:
+      stitch:
+        url: https://stitch.googleapis.com/mcp
+        headers:
+          X-Goog-Api-Key: ${STITCH_API_KEY}
+  planner:                # turns requirements (+ design) into a checked plan. Unset = runs as engineer
+    runtime: claude
+    model: opus
+  engineer:               # builds the plan, writes tests, fixes QA bugs and review comments
     runtime: claude
     model: opus
     timeout_s: 2400
@@ -19,6 +35,27 @@ agents:
   reviewer:               # always a fresh session; final approver
     runtime: claude
     model: opus
+
+# Which stages each kind of task goes through. planner, engineer and
+# reviewer are required; product_owner, ux and qa are optional. Listed in
+# run order. These four are built in — define one here to change it, or add
+# your own. Chosen per task: --workflow <name>, else the first workflow
+# (in this order, then the built-ins) with a label the task/issue carries,
+# else default_workflow.
+workflows:
+  bug:
+    stages: [planner, engineer, qa, reviewer]
+    labels: [bug]
+  ui_feature:
+    stages: [product_owner, ux, planner, engineer, qa, reviewer]
+    labels: [ui, ux, design, frontend]
+  feature:
+    stages: [product_owner, planner, engineer, qa, reviewer]
+    labels: [feature, enhancement]
+  refactor:
+    stages: [planner, engineer, qa, reviewer]
+    labels: [refactor, tech-debt]
+default_workflow: feature
 
 # Where the code comes from. A clone URL or a local path; the task always
 # works in a fresh clone of base_branch. Env: DEVLOOP_REPO_URL, DEVLOOP_BASE_BRANCH.
@@ -31,5 +68,20 @@ repo:
 pull_request:
   enabled: true
   draft: false
+
+# `devloop watch`: run DevLoop on GitHub issues.
+github:
+  repo: your-org/your-repo          # default: derived from repo.url
+  labels: [devloop]                 # an issue needs all of these to be picked up
+  exclude_labels: [wip, blocked]
+  priority_labels: [p0, p1]         # earlier label first; then oldest, then lowest number
+  poll_interval_s: 300
+  max_concurrent: 1
+  comment: true                     # comment on the issue when a run starts and ends
+  # status_labels:                  # what DevLoop marks issues with (defaults shown)
+  #   in_progress: devloop:in-progress
+  #   pr_open: devloop:pr-open
+  #   needs_human: devloop:needs-human
+  #   failed: devloop:failed
 
 budget_usd: 20

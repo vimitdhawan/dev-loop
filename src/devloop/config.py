@@ -1,5 +1,6 @@
-"""Operator configuration: who is on the agent team, where the code comes
-from, and whether to open a PR.
+"""Operator configuration: who is on the agent team, which workflow each
+kind of task gets, where the code comes from, whether to open a PR, and
+which GitHub issues `devloop watch` picks up.
 
 Lookup order for the file (first found wins, none is fine):
 `DEVLOOP_CONFIG` → `./devloop.config.yaml` → `$DEVLOOP_HOME/config.yaml`.
@@ -18,12 +19,13 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from devloop.contracts.runs import PullRequestConfig, TeamConfig
 from devloop.contracts.state import BUDGET_USD_DEFAULT
 from devloop.errors import DevLoopError
 from devloop.paths import devloop_home
+from devloop.workflows import DEFAULT_WORKFLOW, WorkflowConfig, merge_workflows
 
 CONFIG_FILE = "devloop.config.yaml"
 
@@ -40,13 +42,61 @@ class RepoConfig(BaseModel):
     base_branch: str | None = None
 
 
+class StatusLabels(BaseModel):
+    """Labels `devloop watch` puts on an issue to say where it is. An issue
+    carrying any of them is not picked up again — remove the label to retry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    in_progress: str = "devloop:in-progress"
+    pr_open: str = "devloop:pr-open"
+    needs_human: str = "devloop:needs-human"
+    failed: str = "devloop:failed"
+
+    def all(self) -> list[str]:
+        return [self.in_progress, self.pr_open, self.needs_human, self.failed]
+
+
+class GitHubConfig(BaseModel):
+    """`devloop watch`: poll a repo's open issues and run the eligible ones."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # owner/name; None = derived from repo.url
+    repo: str | None = None
+    # an issue must carry every one of these to be picked up
+    labels: list[str] = Field(default_factory=lambda: ["devloop"])
+    exclude_labels: list[str] = Field(default_factory=list)
+    # issues with an earlier label here go first; then oldest, then lowest number
+    priority_labels: list[str] = Field(default_factory=list)
+    poll_interval_s: int = Field(default=300, ge=30)
+    max_concurrent: int = Field(default=1, ge=1, le=8)
+    status_labels: StatusLabels = Field(default_factory=StatusLabels)
+    # post a comment on the issue when a run starts and stops
+    comment: bool = True
+
+
 class DevLoopConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agents: TeamConfig = Field(default_factory=TeamConfig)
+    # Merged over the built-in bug / feature / ui_feature / refactor.
+    workflows: dict[str, WorkflowConfig] = Field(default_factory=dict)
+    default_workflow: str = DEFAULT_WORKFLOW
     repo: RepoConfig = Field(default_factory=RepoConfig)
     pull_request: PullRequestConfig = Field(default_factory=PullRequestConfig)
+    github: GitHubConfig = Field(default_factory=GitHubConfig)
     budget_usd: float = BUDGET_USD_DEFAULT
+
+    @model_validator(mode="after")
+    def _merge_workflows(self) -> DevLoopConfig:
+        self.workflows = merge_workflows(self.workflows)
+        if self.default_workflow not in self.workflows:
+            raise ValueError(
+                f"default_workflow {self.default_workflow!r} is not one of: "
+                + ", ".join(self.workflows)
+            )
+        return self
 
 
 def config_path() -> Path | None:

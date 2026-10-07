@@ -1,46 +1,67 @@
 # DevLoop
 
-An autonomous development loop: a task becomes a reviewed, tested change
-through a fixed pipeline of specialist agents, with humans gating the two
-decisions that matter — *are the requirements right* and *should this ship*.
+An autonomous development loop: a task — a markdown file or a labelled
+GitHub issue — becomes a reviewed, tested pull request through a team of
+specialist agents, with humans gating the decisions that matter.
 
 ```
-task ──► requirements ──► plan ──► environment ──► implement ──► verify ──► review ──► branch
-            ▲  ⏸ human                                 │            │
-            └──────────────── replan ◄─────────────────┘            │
-                              repair ◄──────────────────────────────┘
-                                                          ⏸ human merge gate
+issue / task ─► workflow ─► agent ─► artifact ─► agent ─► artifact ─► … ─► PR
+                (bug, feature, ui_feature, refactor — picks which agents run)
 ```
 
 **Design rule:** agents produce artifacts; the orchestrator owns state and
-permissions. A pure `decide()` function is the only code that chooses the next
-step, and it reads only stored facts — never a model's opinion about what
-should happen next.
+permissions. Each agent's validated output becomes a state field that the
+next agent is handed — never a shared conversation — and a pure `decide()`
+function is the only code that chooses the next step, reading only those
+stored facts.
 
-> **Status: Phase 3.** An agent team — Product Owner, Engineer, QA and
-> Reviewer — takes a task from requirements to a PR, with QA testing the
-> running app in a real browser. The Docker sandbox is still ahead: until
-> then agents, check commands and the app run **on your machine**, so only
-> point DevLoop at repos you trust. See [`docs/phases.md`](docs/phases.md).
+> **Status: Phase 4.** Workflows per task type, a separate Planner, a UX
+> stage (Stitch-capable), every hand-off visible in the CLI and on disk, and
+> `devloop watch` for GitHub issues. The Docker sandbox is still ahead:
+> until then agents, check commands and the app run **on your machine**, so
+> only point DevLoop at repos you trust. See [`docs/phases.md`](docs/phases.md).
 
 ---
 
 ## The team
 
-| Role | Does | Session |
+| Role | Hands on | Session |
 |---|---|---|
-| **Product Owner** | turns the task into testable requirements; answers the Engineer's questions (or asks you) | kept for the task |
-| **Engineer** | plans, implements, writes unit + integration tests, fixes QA bugs and review comments | **one session** for plan → build → fixes |
-| **QA** | tests the running app in headless Chromium (Playwright MCP), with screenshots | kept across retests |
-| **Reviewer** | reviews the diff against the plan; **final approver** | **fresh every time** |
+| **Product Owner** | `requirements` — testable acceptance criteria; answers the team's questions (or asks you) | kept for the task |
+| **UX** | `design` — screens, states, interactions, guidelines; uses Stitch when configured | kept for the task |
+| **Planner** | `plan` — files, steps, tests; checked against the repo before any code changes | kept across replans |
+| **Engineer** | `implementation` — builds the plan with unit + integration tests; fixes QA bugs and review comments | kept across fixes |
+| **QA** | `qa` — tests the running app in headless Chromium (Playwright MCP), with screenshots | kept across retests |
+| **Reviewer** | `review` — reviews the diff against the plan and design; **final approver** | **fresh every time** |
 
 ```
-PO → Engineer plans → plan check → Engineer builds → checks → QA → Reviewer → push + PR → you merge
-      ↑ questions ↓        red checks / QA bugs / review comments go back to the Engineer
+PO → UX → Planner → plan check → Engineer → checks → QA → Reviewer → push + PR → you merge
+   ↑ questions from UX / Planner / Engineer   red checks / QA bugs / review comments → Engineer
 ```
 
-Agents never talk to each other directly — every question, answer, bug and
-comment is a validated document the orchestrator routes and records.
+Agents never talk to each other directly and never share a conversation: a
+session only carries a role's memory of its *own* work. Every requirement,
+design, plan, question, answer, bug and comment is a validated document the
+orchestrator stores and hands to the next agent.
+
+## Workflows
+
+Not every task needs every agent. Each task gets a **workflow** — an ordered
+subset of the team — when it starts:
+
+| Workflow | Stages | Picked by label |
+|---|---|---|
+| `bug` | planner → engineer → qa → reviewer | `bug` |
+| `ui_feature` | product_owner → ux → planner → engineer → qa → reviewer | `ui`, `ux`, `design`, `frontend` |
+| `feature` (default) | product_owner → planner → engineer → qa → reviewer | `feature`, `enhancement` |
+| `refactor` | planner → engineer → qa → reviewer | `refactor`, `tech-debt` |
+
+Selection is deterministic: `--workflow <name>` → the first workflow (config
+order, then the built-ins above) with a label the task carries → `default_workflow`.
+Redefine any of them or add your own under `workflows:` in the config —
+Planner, Engineer and Reviewer are required, the rest optional. Without a
+Product Owner the task description *is* the requirement, and questions go
+straight to you.
 
 ## Requirements
 
@@ -69,6 +90,8 @@ Looked up at `DEVLOOP_CONFIG` → `./devloop.config.yaml` →
 ```yaml
 agents:
   product_owner: {runtime: claude, model: sonnet}
+  ux:            {runtime: claude, model: sonnet}   # unset → runs as product_owner
+  planner:       {runtime: claude, model: opus}     # unset → runs as engineer
   engineer:      {runtime: claude, model: opus, timeout_s: 2400}
   qa:            {runtime: claude, model: sonnet}
   reviewer:      {runtime: claude, model: opus}
@@ -80,7 +103,31 @@ budget_usd: 20
 ```
 
 Every task works in a **fresh clone** of `base_branch` at
-`~/.devloop/work/<task-id>`; your checkout is never touched.
+`~/.devloop/work/<task-id>`; your checkout is never touched. The full
+reference, including `workflows:` and `github:`, is
+[`devloop.config.example.yaml`](devloop.config.example.yaml).
+
+### Design tools for UX — Stitch or any MCP server
+
+Any role can get extra MCP servers; the UX role is where design tools go:
+
+```yaml
+agents:
+  ux:
+    runtime: claude
+    model: sonnet
+    mcp_servers:
+      stitch:
+        url: https://stitch.googleapis.com/mcp      # or command: [npx, -y, some-mcp]
+        headers: {X-Goog-Api-Key: "${STITCH_API_KEY}"}
+```
+
+`${VAR}` is read from the environment when the agent starts (`devloop run`
+refuses to start if it's unset), so keys stay out of the config file; the
+per-run MCP config holding the resolved key is owner-only and deleted when
+the agent exits. With no design tool, UX designs in words. Either way its
+`design` document — screens, states, interactions, guidelines and links to
+the Stitch screens — is what the Planner, Engineer, QA and Reviewer get.
 
 ### How the target repo builds, tests and runs — its `devloop.yml`
 
@@ -105,35 +152,98 @@ app:                              # optional — enables browser QA
 
 ```bash
 uv run devloop run --task tasks/reusable_time_picker.md            # repo from config/env
+uv run devloop run --task t.md --workflow bug                      # or --label bug
 uv run devloop run --task t.md --repo ../playrotation --base-branch develop
 uv run devloop run --task t.md --role-model engineer=opus --no-pr  # one-off overrides
 ```
 
+Each agent's hand-off is printed as it lands (`-q` for status lines only). Abridged, illustrative:
+
 ```
--> RECEIVED → PLANNING → PLAN_READY → ENV_BOOTSTRAP → BASELINE → IMPLEMENTING
-   engineer/engineer_implement (claude, attempt 1, resumed session)
--> TESTING → QA_TESTING
-   app ready at http://127.0.0.1:4173/
--> REVIEWING → PUBLISHING → READY_FOR_FINALIZE   $0.4764
+╭ task 72d7693f: reusable time picker ─────────────────────────────────────╮
+│ workflow: ui_feature (label: ui): product_owner → ux → planner → …       │
+ingest → DESIGNING $0.0712
+╭─ Product Owner → requirements ───────────────────────────────────────────╮
+│ acceptance criteria                                                      │
+│   • Selecting 10:30 shows `10:30` in the field and saves `10:30:00`      │
+design → PLANNING $0.1830
+╭─ UX → design ────────────────────────────────────────────────────────────╮
+│ time picker — choose a slot without typing                               │
+│   state: invalid: field outlined red, "Use HH:MM"                        │
+plan → PLAN_READY $0.2954
+╭─ Planner → plan (handed to the Engineer) ────────────────────────────────╮
+│ files   modify  src/components/TimeField.tsx   reuse the field's styles  │
+│ steps   1. …                                                             │
+… Engineer → implementation · checks · QA → passed · Reviewer → approved
+publish → READY_FOR_FINALIZE $0.6120
 ╭──────────────── waiting on a human ─────────────────╮
-│ gate: finalize                                      │
 │ pull_request: https://github.com/org/repo/pull/42   │
-│ summary: ~/.devloop/tasks/72d7693f/summary.md       │
-╰─────────────────────────────────────────────────────╯
 ```
 
 Then review and merge the PR on GitHub, and close the task:
 
 ```bash
-uv run devloop show 72d7693f                     # status, cost, every agent run (↻ = resumed session)
 uv run devloop resume 72d7693f --answer approve  # or --answer cancel
 ```
 
+### Inspect a task later
+
+```bash
+uv run devloop show 72d7693f              # every artifact, then every agent run (↻ = resumed)
+uv run devloop show 72d7693f --run 4      # run #4's exact input (context.json) and output
+uv run devloop show 72d7693f --json plan  # one state field as JSON (requirements, design, qa, …)
+uv run devloop show 72d7693f --events     # node-by-node timeline
+```
+
+The graph itself writes each task's record — `state.json` after every
+node, `events.jsonl`, and per agent run `runs/NNN-<step>-a<n>/` with the
+exact `context.json`, `prompt.md` and `output.json` — so this works for
+tasks run from `devloop run`, `devloop watch` **and** LangGraph Studio, and
+it's what a TUI, web UI or eval would read.
+
 A task can also pause to ask you something — the Product Owner's questions
-about the task, or an Engineer question the Product Owner couldn't answer.
+about the task, or a UX / Planner / Engineer question the Product Owner
+couldn't answer (or any question, in a workflow without a Product Owner).
 Reply with `devloop resume <id> --answer '...'` and it continues where it
 stopped. It escalates on budget, iteration/replan/question caps, an agent
 failure, QA being blocked, or a disputed finding; `devloop show` says why.
+
+### Run from GitHub issues — `devloop watch`
+
+```yaml
+github:
+  repo: your-org/your-repo      # default: from repo.url
+  labels: [devloop]             # issues need all of these
+  exclude_labels: [wip]
+  priority_labels: [p0, p1]
+  poll_interval_s: 300
+  max_concurrent: 1
+```
+
+```bash
+uv run devloop watch --dry-run   # eligible issues in pick order, with the workflow each gets
+uv run devloop watch --once      # one poll: start what fits, wait, exit (for cron)
+uv run devloop watch             # poll every poll_interval_s until Ctrl-C
+```
+
+Each poll lists open issues carrying `labels`, drops any with an
+`exclude_labels` or DevLoop status label, orders them (earliest
+`priority_labels` match, then oldest, then lowest number) and starts as
+many as `max_concurrent` allows. The issue's labels pick its workflow.
+
+| Issue label | Means | To retry |
+|---|---|---|
+| `devloop:in-progress` | a run is going | — |
+| `devloop:pr-open` | approved by review, PR opened (`Closes #n` in the body) | — |
+| `devloop:needs-human` | waiting on an answer or escalated — the comment says why and gives the `devloop resume` command | answer it with `devloop resume`, or remove the label |
+| `devloop:failed` | crashed or cancelled | remove the label |
+
+An issue is never run twice at once: a claim in
+`~/.devloop/automation.sqlite` (atomic across processes on this machine)
+plus the in-progress label (visible to other machines — best effort, this is
+not a distributed lock). A watcher killed mid-run flags its issues
+`needs-human` on the next start. `devloop resume` on a watched task updates
+the issue the same way.
 
 ### Watch it in LangGraph Studio
 
@@ -147,11 +257,12 @@ uv run langgraph dev            # opens Studio: https://smith.langchain.com/stud
 In Studio, pick the `devloop` graph and start a run with:
 
 ```json
-{"task": {"title": "default rating", "description": "<paste the task markdown>"}}
+{"task": {"title": "default rating", "description": "<paste the task markdown>", "labels": ["ui"]}}
 ```
 
 Repo, base branch, team, PR and budget come from `devloop.config.yaml`; put
-`repo` / `base_branch` inside `task`, or a `team` object, to override them.
+`repo` / `base_branch` / `workflow` / `labels` inside `task`, or a `team`
+object, to override them.
 You see every node as it runs, the full state after each one (requirements,
 plan, QA report, review, agent runs and costs), and the human gates appear
 as interrupts you answer in the UI (`{"answer": "approve"}`).
@@ -159,8 +270,10 @@ as interrupts you answer in the UI (`{"answer": "approve"}`).
 Things to know:
 
 - Studio runs live in the dev server's own store, **not** in
-  `~/.devloop/checkpoints.sqlite` — a task started in Studio is driven from
-  Studio, and one started with `devloop run` is driven from the CLI.
+  `~/.devloop/checkpoints.sqlite` — a task started in Studio is *driven*
+  from Studio, and one started with `devloop run` from the CLI. Both write
+  the same task record, so `devloop show <task-id>` (the id is in the
+  state's `task.external_id`) inspects either.
 - The Studio UI is served from smith.langchain.com and connects to your
   local server; your graph, state and code stay on your machine. LangSmith
   *tracing* (`LANGSMITH_TRACING=true` + an API key in `.env`) is off by
@@ -209,6 +322,9 @@ need a vision model. Free-tier models are often slow — raise `timeout_s`.
 | `no devloop.yml and no recognised build manifest` | add a `devloop.yml` with `commands:` |
 | `gh pr create failed` | `gh auth status`; the token needs `repo` scope |
 | an agent seems stuck | the `tail -f` path in the heartbeat log line shows its live output |
+| `MCP server 'stitch' needs STITCH_API_KEY` | export the variable the config's `${…}` refers to |
+| `unknown workflow 'x'` | `--workflow` / `task.workflow` must name one in `devloop config` |
+| `devloop watch` picks nothing | `--dry-run`; the issue needs every `github.labels` and no `devloop:*` label |
 
 ### Commands
 
@@ -219,8 +335,10 @@ need a vision model. Free-tier models are often slow — raise `timeout_s`.
 | `  --runtime` / `--model` | Override every role |
 | `  --role-runtime qa=opencode` / `--role-model engineer=opus` | Override one role, repeatable |
 | `  --agent-timeout <s>` / `--budget-usd <n>` / `--pr/--no-pr` | Limits and PR |
+| `  --workflow <name>` / `--label <l>` / `-q` | Pick the workflow; quiet output |
 | `devloop resume <task-id> --answer <text>` | Answer a gate and continue |
-| `devloop show <task-id>` | Status, PR, cost, escalation reason, agent runs |
+| `devloop show <task-id> [--run N] [--json F] [--events]` | Artifacts, agent runs, exact hand-offs, timeline |
+| `devloop watch [--once] [--dry-run]` | Run on labelled GitHub issues |
 | `devloop config` | Effective configuration and its source |
 | `devloop probe [--runtime r --model m …]` | Check each runtime/model can do a DevLoop step |
 | `langgraph dev` | Run the graph in LangGraph Studio |
@@ -231,7 +349,8 @@ need a vision model. Free-tier models are often slow — raise `timeout_s`.
 |---|---|
 | `~/.devloop/checkpoints.sqlite` | graph state (`DEVLOOP_DATABASE_URL` for Postgres) |
 | `~/.devloop/work/<task-id>/` | the task's clone; `.devloop/in`, `.devloop/out`, `.devloop/qa` (screenshots) |
-| `~/.devloop/tasks/<task-id>/` | `summary.md` (PR body), `agent_runs.jsonl`, agent/check/app logs |
+| `~/.devloop/tasks/<task-id>/` | `state.json`, `events.jsonl`, `runs/NNN-*/` (context, prompt, output), `summary.md` (PR body), `agent_runs.jsonl`, logs |
+| `~/.devloop/automation.sqlite` | `devloop watch` issue claims |
 | `prompts/<step>/v<N>.md` | versioned prompts (`DEVLOOP_PROMPT_<STEP>=v<N>` pins one) |
 
 `DEVLOOP_HOME` moves `~/.devloop`.

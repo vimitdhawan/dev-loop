@@ -16,13 +16,14 @@ from typing import Any
 import pytest
 from langgraph.types import Command
 
-from devloop.contracts.runs import AgentConfig, PullRequestConfig, Step, TeamConfig
+from devloop.contracts.runs import AgentConfig, PullRequestConfig, Role, Step, TeamConfig, Workflow
 from devloop.contracts.state import DevLoopState, TaskInput
 from devloop.contracts.status import DevLoopStatus as St
 from devloop.graph.build import build_graph
 from devloop.runtimes.base import AgentInvocation, AgentOutcome
 from devloop.runtimes.registry import register_runtime
 from devloop.runtimes.stub import NOTES_FILE, StubAgent
+from devloop.store import records
 from devloop.store.checkpointer import checkpointer
 from tests.conftest import git
 
@@ -49,7 +50,13 @@ QA_FAIL = {
 
 class Task:
     def __init__(
-        self, repo: Path | str, runtime: str = "stub", *, pr: bool = True, base: str | None = None
+        self,
+        repo: Path | str,
+        runtime: str = "stub",
+        *,
+        pr: bool = True,
+        base: str | None = None,
+        workflow: Workflow | None = None,
     ) -> None:
         self.config = {"configurable": {"thread_id": "t1"}}
         self.graph: Any = build_graph(checkpointer=checkpointer())
@@ -80,6 +87,8 @@ class Task:
             "feedback": [],
             "agent_runs": [],
         }
+        if workflow is not None:
+            self.initial["workflow"] = workflow
 
     def start(self) -> dict[str, Any]:
         return self._drive(self.initial)
@@ -163,7 +172,7 @@ def test_cancel_at_finalize(target_repo: Path) -> None:
     assert task.resume({"answer": "cancel"})["status"] == St.CANCELLED
 
 
-def test_engineer_keeps_one_session_and_reviewer_never_resumes(target_repo: Path) -> None:
+def test_each_role_keeps_its_own_session_and_reviewer_never_resumes(target_repo: Path) -> None:
     agent = stub({Step.REVIEW: [REJECT]})
     task = Task(target_repo, runtime="scripted")
 
@@ -173,8 +182,9 @@ def test_engineer_keeps_one_session_and_reviewer_never_resumes(target_repo: Path
     for step, session in agent.sessions:
         by_step.setdefault(step, []).append(session)
     engineer = state["sessions"]["engineer"]
-    assert by_step[Step.PLAN] == [None], "the engineer's session starts at planning"
-    assert by_step[Step.IMPLEMENT] == [engineer, engineer], "…and implements + fixes in it"
+    assert by_step[Step.PLAN] == [None]
+    assert state["sessions"]["planner"] != engineer, "the plan is handed over, not the session"
+    assert by_step[Step.IMPLEMENT] == [None, engineer], "the engineer fixes in its own session"
     assert by_step[Step.REVIEW] == [None, None], "every review starts fresh"
     assert "reviewer" not in state["sessions"]
 
@@ -276,7 +286,7 @@ def test_initial_clarification_pauses_and_folds_the_answer_in(target_repo: Path)
     assert state["clarifications"][0].answered_by == "human"
 
 
-def test_engineer_question_is_answered_by_the_po_in_its_own_session(target_repo: Path) -> None:
+def test_planner_question_is_answered_by_the_po_in_its_own_session(target_repo: Path) -> None:
     asks = {"summary": "on hold", "questions_for_po": ["Which date format?"]}
     agent = stub({Step.PLAN: [asks]})
     task = Task(target_repo, runtime="scripted")
@@ -290,8 +300,8 @@ def test_engineer_question_is_answered_by_the_po_in_its_own_session(target_repo:
     assert state["clarifications"][0].answered_by == "product_owner"
     po_session = state["sessions"]["product_owner"]
     assert (Step.PO_ANSWER, po_session) in agent.sessions, "PO answers in its own session"
-    engineer = state["sessions"]["engineer"]
-    assert [s for st, s in agent.sessions if st == Step.PLAN] == [None, engineer]
+    planner = state["sessions"]["planner"]
+    assert [s for st, s in agent.sessions if st == Step.PLAN] == [None, planner]
 
 
 def test_question_the_po_cant_answer_goes_to_a_human_then_back(target_repo: Path) -> None:
@@ -471,3 +481,113 @@ def test_bad_raw_input_escalates_instead_of_crashing() -> None:
 
     assert state["status"] == St.ESCALATED
     assert "description is required" in state["escalation_reason"]
+
+
+# --- workflows ---------------------------------------------------------------
+
+P, U, PL, E, Q, R = (
+    Role.PRODUCT_OWNER,
+    Role.UX,
+    Role.PLANNER,
+    Role.ENGINEER,
+    Role.QA,
+    Role.REVIEWER,
+)
+
+
+def run_context(state: dict[str, Any], step: Step) -> dict[str, Any]:
+    """The context file the first run of `step` was handed."""
+
+    record = next(r for r in state["agent_runs"] if r.step == step)
+    context: dict[str, Any] = json.loads((Path(record.run_dir) / "context.json").read_text())
+    return context
+
+
+def test_bug_workflow_skips_the_product_owner(target_repo: Path) -> None:
+    task = Task(target_repo, workflow=Workflow(name="bug", stages=[PL, E, Q, R]))
+
+    state = task.start()
+
+    assert state["status"] == St.READY_FOR_FINALIZE
+    assert steps(state) == [Step.PLAN, Step.IMPLEMENT, Step.REVIEW]  # no app: QA skips itself
+    assert state.get("requirements") is None
+    assert run_context(state, Step.PLAN)["workflow"]["name"] == "bug"
+
+
+def test_workflow_without_qa_never_enters_qa(target_repo: Path) -> None:
+    with_app(target_repo)
+    task = Task(target_repo, workflow=Workflow(name="docs", stages=[PL, E, R]))
+
+    state = task.start()
+
+    assert state["status"] == St.READY_FOR_FINALIZE
+    assert St.QA_TESTING not in state["_statuses"]
+    assert Step.QA not in steps(state)
+
+
+def test_ui_workflow_hands_the_design_to_the_planner_and_engineer(target_repo: Path) -> None:
+    task = Task(target_repo, workflow=Workflow(name="ui_feature", stages=list(Role)))
+
+    state = task.start()
+
+    assert state["status"] == St.READY_FOR_FINALIZE
+    assert steps(state)[:3] == [Step.REQUIREMENTS, Step.DESIGN, Step.PLAN]
+    assert St.DESIGNING in state["_statuses"]
+    assert run_context(state, Step.PLAN)["design"]["screens"][0]["name"] == "notes panel"
+    implement = run_context(state, Step.IMPLEMENT)
+    assert implement["plan"] == state["plan"].model_dump(mode="json"), "the checked plan"
+    assert implement["design"]["summary"] == state["design"].summary
+
+
+def test_ux_question_is_answered_by_the_po_then_ux_continues(target_repo: Path) -> None:
+    asks = {"summary": "on hold", "questions_for_po": ["Dark mode too?"]}
+    agent = stub({Step.DESIGN: [asks]})
+    task = Task(target_repo, runtime="scripted", workflow=Workflow(name="ui", stages=list(Role)))
+
+    state = task.start()
+
+    assert state["status"] == St.READY_FOR_FINALIZE
+    assert steps(state)[:4] == [Step.REQUIREMENTS, Step.DESIGN, Step.PO_ANSWER, Step.DESIGN]
+    ux = state["sessions"]["ux"]
+    assert [s for st, s in agent.sessions if st == Step.DESIGN] == [None, ux]
+
+
+def test_without_a_product_owner_questions_go_to_a_human(target_repo: Path) -> None:
+    asks = {"summary": "s", "questions_for_po": ["Which endpoint is broken?"]}
+    stub({Step.PLAN: [asks]})
+    task = Task(
+        target_repo, runtime="scripted", workflow=Workflow(name="bug", stages=[PL, E, Q, R])
+    )
+
+    paused = task.start()
+    assert paused["status"] == St.CLARIFICATION_REQUIRED
+    assert Step.PO_ANSWER not in steps(paused)
+
+    state = task.resume({"answer": "/api/slots"})
+    assert state["status"] == St.READY_FOR_FINALIZE
+    assert state["clarifications"][0].answer == "/api/slots"
+    assert state["clarifications"][0].answered_by == "human"
+
+
+# --- the task record -----------------------------------------------------------
+
+
+def test_every_node_and_agent_run_is_recorded(target_repo: Path) -> None:
+    state = Task(target_repo).start()
+
+    recorded = records.load_state("t1")
+    assert recorded is not None
+    assert recorded["status"] == St.READY_FOR_FINALIZE
+    assert recorded["plan"] == state["plan"]
+    assert len(recorded["agent_runs"]) == len(state["agent_runs"]), "appended, not overwritten"
+
+    events = records.load_events("t1")
+    assert [e["node"] for e in events][:2] == ["ingest", "plan"]
+    assert "requirements" in events[0]["produced"]
+    assert events[-1]["status"] == "READY_FOR_FINALIZE"
+
+    for run in state["agent_runs"]:
+        run_dir = Path(run.run_dir)
+        assert (run_dir / "context.json").exists() and (run_dir / "prompt.md").exists()
+        assert json.loads((run_dir / "output.json").read_text())
+    assert run_context(state, Step.REVIEW)["role"] == "reviewer"

@@ -12,26 +12,30 @@ swap is a one-module change.
 
 ## What DevLoop is
 
-A task — a markdown file today, a GitHub issue later — becomes a reviewed,
-tested change through a fixed pipeline run by an agent **team**, with humans
-gating the two decisions that matter: *are the requirements right* and
-*should this merge*.
+A task — a markdown file, a labelled GitHub issue, or a Studio run —
+becomes a reviewed, tested pull request through a pipeline run by an agent
+**team**, with humans gating the decisions that matter: *are the
+requirements right* and *should this merge*. The task's **workflow** decides
+which of the optional stages it goes through.
 
 ```
-task ──► Product Owner ──► Engineer: plan ──► env ──► Engineer: implement ──► checks ──► QA ──► Reviewer ──► PR
-              ▲ ⏸ human        │  ▲ answers                 │                    │         │        │
-              └── questions ◄──┴──┴────────── questions ◄────┘                    │         │        │
-                                    replan ◄──────────────────────────────────────┼─────────┼────────┤
-                                    repair ◄──────────────────────────── red ─────┴── bugs ─┴─ changes
-                                                                                         ⏸ human merge gate
+issue ─► workflow ─► Product Owner ─► UX ─► Planner ─► Engineer ─► checks ─► QA ─► Reviewer ─► PR
+                     (optional)   (optional)  │  ▲         ▲          │ red   │ bugs   │ changes
+                          ▲ answers           │  │ replan  └──────────┴───────┴────────┘
+                          └──── questions ◄───┴──┘                                ⏸ human merge gate
 ```
 
-| Role | Does | Session |
+| Role | Hands on | Session |
 |---|---|---|
-| Product Owner | requirements; answers the Engineer | kept |
-| Engineer | plans, implements, writes unit + integration tests, fixes | **one session** across all |
-| QA | tests the running app in a browser | kept across retests |
+| Product Owner | requirements; answers the team's questions | kept |
+| UX | design (screens, states, Stitch references) | kept |
+| Planner | the checked plan | kept across replans |
+| Engineer | implementation + unit/integration tests; fixes | kept across fixes |
+| QA | browser test report | kept across retests |
 | Reviewer | code review, final approval | **fresh every time** |
+
+Each arrow is a validated document stored in state — never a shared
+conversation (see [Hand-offs are state](#hand-offs-are-state-not-conversation)).
 
 ---
 
@@ -88,11 +92,11 @@ The things that must stay swappable, and what fills each slot over time:
 
 | Seam | v0 (today) | Later |
 |---|---|---|
-| **Source** | local CLI + markdown file; repo = path or clone URL + base branch | GitHub App webhooks, Jira, Linear |
+| **Source** | local CLI + markdown file; GitHub issues by label (`devloop watch`, polling via `gh`); LangGraph Studio | GitHub App webhooks, Jira, Linear |
 | **Runtime** | `claude` CLI, `opencode` CLI — per role, from `devloop.config.yaml` | `codex exec`, in-process Agent SDK |
 | **Sandbox** | per-task fresh clone, commands + app run on host | Docker per task → E2B / Modal / k8s |
 | **Sink** | pushed branch + GitHub PR via `gh` (body = plan + evidence) | GitHub App, checks, pinned status comment |
-| **State** | SQLite checkpoints | Postgres + domain tables |
+| **State** | SQLite checkpoints + per-task record on disk (`state.json`, `events.jsonl`, `runs/`) | Postgres + domain tables |
 | **Knowledge** | — | Postgres facts rendered into the sandbox |
 
 ---
@@ -113,9 +117,10 @@ Defined in `devloop.contracts`:
 
 | Contract | Produced by | Read by |
 |---|---|---|
-| `RequirementResult` | Product Owner | `decide()` (`status` field) |
-| `POAnswer` (`Clarification`) | Product Owner | Engineer (via context), `decide()` (`needs_human`) |
-| `PlanResult` (+ `questions_for_po`) | Engineer | Engineer, QA, Reviewer, `decide()` |
+| `RequirementResult` | Product Owner | UX, Planner, Engineer, QA, Reviewer; `decide()` (`status`) |
+| `POAnswer` (`Clarification`) | Product Owner | whoever asked (via context), `decide()` (`needs_human`) |
+| `DesignResult` (`ScreenDesign`, `DesignReference`, `questions_for_po`) | UX | Planner, Engineer, QA, Reviewer; `decide()` (present / questions) |
+| `PlanResult` (+ `questions_for_po`) | Planner | Engineer, QA, Reviewer, `decide()` |
 | `QAResult` (`QAScenario`, `Finding`) | QA | `decide()` (`verdict`, `severity`), Engineer, Reviewer |
 | `EnvRecipe` | Bootstrap agent | Sandbox, cached per repo |
 | `ImplementationResult` (`Deviation`, `PlanInvalidation`, `FindingDispute`, `questions_for_po`) | Engineer | `decide()` (`plan_invalid`, questions), QA, Reviewer |
@@ -125,6 +130,30 @@ Defined in `devloop.contracts`:
 
 `ReviewResult.verdict` and `Finding.severity` are read directly by the routing
 policy — treat them as versioned API, not implementation detail.
+
+### Hand-offs are state, not conversation
+
+Each validated document becomes a state field (`requirements`, `design`,
+`plan`, `implementation`, `qa`, `review`), and the next agent gets it in its
+context file — the Engineer builds the *checked plan*, not whatever the
+Planner was thinking. Agent sessions (`--resume`) only carry a role's memory
+of its own earlier steps (the Engineer across fixes, QA across retests), so
+any role can be swapped for another runtime or model without the next one
+noticing. The context file is complete on every call, so a lost session
+changes nothing.
+
+Every hand-off is also kept on disk, written by the graph itself so it
+exists whichever process ran the task (CLI, `watch`, Studio's server):
+
+| Path under `tasks/<id>/` | Holds |
+|---|---|
+| `state.json` | the full state after the latest node |
+| `events.jsonl` | one line per node: from/to status, what it produced, cost |
+| `runs/NNN-<step>-a<n>/` | one agent attempt: exact `context.json` in, `prompt.md`, `output.json` out |
+
+That's the material for observing (`devloop show`), debugging (what was the
+Engineer actually told?), evaluating and comparing models (replay a
+`context.json` with another model), and a future TUI or web UI.
 
 An agent may run tests for its own feedback. Only **orchestrator-run** results
 are admissible as facts.
@@ -232,17 +261,17 @@ Each fact carries `confidence`, `provenance: list[task_id]`,
 
 ## The graph
 
-16 nodes; each status maps to exactly one (`STATUS_TO_NODE` in
+17 nodes; each status maps to exactly one (`STATUS_TO_NODE` in
 `graph/build.py`, total over the enum).
 
 ```
-ingest (PO: requirements) ─► clarify ⏸ ◄──────────────┐ needs_human
+ingest (PO: requirements) ─► clarify ⏸ ◄──────────────┐ needs_human (or no PO in the workflow)
         │                        │                      │
         ▼                        ▼                      │
-      plan (Engineer) ◄──── answers ──── consult_po (PO) ◄── questions_for_po
-        │                                               ▲   (from plan, replanning, implement)
+   design (UX) ─► plan (Planner) ◄── answers ── consult_po (PO) ◄── questions_for_po
+        │                                               ▲   (from design, plan, replanning, implement)
         ▼                                               │
-   env_gate ─► env_bootstrap ─► baseline ─► implement (Engineer, same session)
+   env_gate ─► env_bootstrap ─► baseline ─► implement (Engineer, own session)
                                                │  ▲
                                                ▼  │ changes_required ◄── red checks / QA bugs / review
                                             verify ─► qa_test (QA + app) ─► review (fresh) ─► publish (push + PR)
@@ -250,6 +279,24 @@ ingest (PO: requirements) ─► clarify ⏸ ◄──────────�
                                          replanning ◄── plan_conformance / plan_invalid          ▼
                                          escalate ⏸ ◄── budget, caps, agent failure          finalize ⏸ → done
 ```
+
+### Workflows
+
+The graph has one shape for every task. Which optional stages run —
+Product Owner, UX, QA — is the task's `Workflow` (`bug`, `feature`,
+`ui_feature`, `refactor`, or any defined in config), chosen once at the
+start (`--workflow` → first matching issue label → default) and stored in
+state. `decide()` routes around the stages it doesn't list, so every
+workflow gets the same guards, and adding one is a config entry:
+
+| Workflow skips | Effect in `decide()` |
+|---|---|
+| Product Owner | `RECEIVED → PLANNING` (or `DESIGNING`) without requirements; questions go straight to a human |
+| UX | requirements go straight to `PLANNING` (UX otherwise: `→ DESIGNING → PLANNING`) |
+| QA | green checks go straight to `REVIEWING`; approval doesn't need a QA pass |
+
+Planner, Engineer and Reviewer are mandatory: nothing ships unplanned or
+unreviewed. A task from before workflows existed runs as `feature`.
 
 **Node granularity is dictated by a LangGraph constraint, not by taste.**
 `interrupt()` re-runs its node from the top on resume — checkpoints exist only
@@ -270,10 +317,10 @@ twice. Therefore:
 | Failed side effect | any in-flight status → `ESCALATED` once a node records `escalation_reason` |
 | Review iterations | `CHANGES_REQUIRED → IMPLEMENTING` only while `iteration < 3` (attempts, not questions) |
 | Replans | plan-conformance findings or `plan_invalid` → `REPLANNING` only while `replan_count < 2` |
-| PO consultations | Engineer questions → `CONSULTING_PO` only while `po_consultations < 3` |
+| PO consultations | UX / Planner / Engineer questions → `CONSULTING_PO` only while `po_consultations < 3` (no PO in the workflow → a human) |
 | Red before QA | `TESTING` with a failure absent from baseline → `CHANGES_REQUIRED` (no QA/review spend) |
 | QA | `failed`, or any unresolved P0/P1 → `CHANGES_REQUIRED`; `blocked` → `ESCALATED` |
-| Publish | `REVIEWING → PUBLISHING` requires `approved`, no unresolved P0/P1, no new failures **and** QA `passed`/`skipped` |
+| Publish | `REVIEWING → PUBLISHING` requires `approved`, no unresolved P0/P1, no new failures **and** QA `passed`/`skipped` (or no QA in the workflow) |
 
 `ESCALATED` means *needs a human*, not dead. `CANCELLED` and `FINALIZED` are
 terminal.

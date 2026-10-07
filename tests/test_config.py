@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from devloop.config import ConfigError, load_config
-from devloop.contracts.runs import Role
+from devloop.contracts.runs import AgentConfig, McpServerConfig, Role, TeamConfig
 
 CONFIG = """\
 agents:
@@ -74,3 +75,45 @@ def test_invalid_config_is_rejected(tmp_path: Path, content: str) -> None:
     (tmp_path / "devloop.config.yaml").write_text(content)
     with pytest.raises(ConfigError):
         load_config()
+
+
+# --- roles added after a config was written --------------------------------
+
+
+def test_unset_planner_and_ux_run_as_their_fallback_roles() -> None:
+    team = TeamConfig(
+        engineer=AgentConfig(runtime="opencode", model="nvidia/x"),
+        product_owner=AgentConfig(model="sonnet"),
+    )
+
+    assert team.for_role(Role.PLANNER).model == "nvidia/x"
+    assert team.for_role(Role.UX).model == "sonnet"
+    team.engineer.model = "opus"
+    assert team.for_role(Role.PLANNER).model == "opus", "follows the engineer until set"
+
+    team.own(Role.PLANNER).model = "haiku"
+    assert team.for_role(Role.PLANNER).model == "haiku"
+    assert team.engineer.model == "opus", "overriding the planner leaves the engineer alone"
+
+
+def test_mcp_server_needs_exactly_one_transport() -> None:
+    assert McpServerConfig(url="https://x/mcp").url
+    assert McpServerConfig(command=["npx", "srv"]).command
+    bad_configs: list[dict[str, object]] = [
+        {},
+        {"url": "https://x", "command": ["a"]},
+        {"command": []},
+    ]
+    for bad in bad_configs:
+        with pytest.raises(ValidationError):
+            McpServerConfig.model_validate(bad)
+
+
+def test_the_example_config_is_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    example = Path(__file__).parents[1] / "devloop.config.example.yaml"
+    monkeypatch.setenv("DEVLOOP_CONFIG", str(example))
+
+    config = load_config()
+
+    assert config.agents.for_role(Role.UX).mcp_servers["stitch"].url
+    assert config.github.labels == ["devloop"]

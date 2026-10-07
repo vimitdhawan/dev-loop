@@ -55,3 +55,28 @@ def test_input_overrides_the_config() -> None:
 def test_description_is_required() -> None:
     with pytest.raises(DevLoopError, match="description"):
         normalize_input({"task": {"title": "t"}})  # type: ignore[typeddict-item]
+
+
+@pytest.mark.parametrize(
+    "task,expected",
+    [
+        ({"title": "t", "description": "d"}, ("feature", "default")),
+        ({"title": "t", "description": "d", "labels": ["bug"]}, ("bug", "label: bug")),
+        (
+            {"title": "t", "description": "d", "workflow": "ui_feature"},
+            ("ui_feature", "requested: ui_feature"),
+        ),
+    ],
+)
+def test_studio_input_picks_the_workflow(
+    task: dict[str, object], expected: tuple[str, str]
+) -> None:
+    state = normalize_input({"task": task})  # type: ignore[typeddict-item]
+
+    workflow = state["workflow"]
+    assert workflow is not None and (workflow.name, workflow.selected_by) == expected
+
+
+def test_studio_input_with_an_unknown_workflow_is_rejected() -> None:
+    with pytest.raises(DevLoopError, match="unknown workflow"):
+        normalize_input({"task": {"title": "t", "description": "d", "workflow": "x"}})  # type: ignore[typeddict-item]

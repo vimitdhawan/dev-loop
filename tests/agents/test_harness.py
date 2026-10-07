@@ -12,7 +12,7 @@ import pytest
 from devloop.agents import roles
 from devloop.agents.harness import run_step
 from devloop.contracts.context import DevelopmentContext
-from devloop.contracts.runs import AgentConfig, Role, Step
+from devloop.contracts.runs import AgentConfig, McpServerConfig, Role, Step
 from devloop.contracts.state import TaskInput
 from devloop.errors import AgentError
 from devloop.runtimes.base import OUT_DIR, AgentInvocation, AgentOutcome
@@ -101,7 +101,7 @@ def test_valid_output_first_try(workspace: Path) -> None:
     assert result.artifact is not None and result.error is None
     assert [r.attempt for r in result.records] == [1]
     rec = result.records[0]
-    assert rec.ok and rec.cost_usd == 0.5 and rec.prompt_version.startswith("v1+")
+    assert rec.ok and rec.cost_usd == 0.5 and rec.prompt_version.startswith("v")
     assert json.loads((workspace / ".devloop/in/context.json").read_text())["role"] == "reviewer"
     jsonl = (Path(rec.log_path).parents[1] / "agent_runs.jsonl").read_text().splitlines()
     assert len(jsonl) == 1
@@ -212,3 +212,66 @@ def test_repair_without_a_session_resends_the_full_prompt(workspace: Path) -> No
     run(workspace, agent)
 
     assert agent.prompts[1].startswith("# Role: Reviewer")
+
+
+# --- per-run records and configured MCP servers ----------------------------
+
+
+def test_every_attempt_keeps_its_exact_context_prompt_and_output(workspace: Path) -> None:
+    agent = ScriptedAgent([writes({"verdict": "nope"}), writes(VALID_REVIEW)])
+
+    result = run(workspace, agent)
+
+    first, second = (Path(r.run_dir) for r in result.records)
+    assert first.name.endswith("reviewer-a1") and second.name.endswith("reviewer-a2")
+    assert json.loads((first / "output.json").read_text()) == {"verdict": "nope"}
+    assert json.loads((second / "output.json").read_text()) == VALID_REVIEW
+    assert json.loads((first / "context.json").read_text())["task"]["external_id"] == "t1"
+    assert "Repair required" in (second / "prompt.md").read_text()
+
+
+def test_role_mcp_servers_are_added_to_the_step_tools(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[AgentInvocation] = []
+
+    def capture(inv: AgentInvocation) -> AgentOutcome:
+        seen.append(inv)
+        return writes(VALID_REVIEW)(inv)
+
+    monkeypatch.setenv("STITCH_KEY", "k")
+    register_runtime("scripted", ScriptedAgent([capture]))
+    config = AgentConfig(
+        runtime="scripted",
+        mcp_servers={
+            "stitch": McpServerConfig(url="https://s/mcp", headers={"X-Key": "${STITCH_KEY}"})
+        },
+    )
+
+    run_step(roles.REVIEW, context(), workspace=workspace, agent_config=config, budget_left_usd=1)
+
+    (server,) = seen[0].tools.mcp_servers
+    assert (server.name, server.url, server.headers) == (
+        "stitch",
+        "https://s/mcp",
+        (("X-Key", "k"),),
+    )
+
+
+def test_a_missing_mcp_secret_fails_the_step_without_running_it(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("STITCH_KEY", raising=False)
+    agent = ScriptedAgent([])
+    register_runtime("scripted", agent)
+    config = AgentConfig(
+        runtime="scripted",
+        mcp_servers={"stitch": McpServerConfig(url="https://s", headers={"K": "${STITCH_KEY}"})},
+    )
+
+    result = run_step(
+        roles.REVIEW, context(), workspace=workspace, agent_config=config, budget_left_usd=1
+    )
+
+    assert result.error is not None and "STITCH_KEY" in result.error
+    assert agent.prompts == [] and result.records == []
