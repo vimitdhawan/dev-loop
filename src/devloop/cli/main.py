@@ -1,18 +1,22 @@
-"""`devloop` local CLI — the v0 source and sink.
+"""`devloop` CLI.
 
-`devloop run` drives a task from a markdown file through the agent team to
-a pushed `devloop/<task-id>-<slug>` branch — and a PR when the repo is on
-GitHub. Human gates (`clarify`, `finalize`, `escalate`) are answered from
-the terminal via LangGraph's `interrupt()`/`Command(resume=...)`.
+`devloop run` drives a task from a markdown file through its workflow's
+agents to a pushed `devloop/<task-id>-<slug>` branch — and a PR when the
+repo is on GitHub — printing what each agent hands the next as it lands.
+`devloop watch` does the same for labelled GitHub issues, continuously.
+Human gates (`clarify`, `finalize`, `escalate`) are answered with
+`devloop resume`, via LangGraph's `interrupt()`/`Command(resume=...)`.
 
-Who is on the team comes from `devloop.config.yaml` (see
-`devloop.config.example.yaml`); flags override it for one run.
+Who is on the team, and which workflow each kind of task gets, comes from
+`devloop.config.yaml` (see `devloop.config.example.yaml`); flags override
+it for one run.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -22,22 +26,36 @@ import typer
 import yaml
 from langgraph.types import Command
 from rich import print as rprint
+from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 
+from devloop.cli import render
 from devloop.config import ConfigError, DevLoopConfig, config_path, load_config
 from devloop.contracts.runs import Role
 from devloop.contracts.state import TaskInput
+from devloop.errors import DevLoopError
 from devloop.graph.build import build_graph
+from devloop.graph.execute import Outcome, drive
 from devloop.graph.inputs import new_task_state
-from devloop.paths import workspace_dir
+from devloop.paths import task_dir, workspace_dir
+from devloop.runtimes.base import env_refs
 from devloop.runtimes.probe import check_model
 from devloop.runtimes.probe import probe as run_probe
 from devloop.runtimes.registry import known_runtimes
+from devloop.store import records
 from devloop.store.checkpointer import checkpointer
 
 app = typer.Typer(no_args_is_help=True)
+console = Console()
+
+# The state fields `show --json` can dump.
+_FIELDS = (
+    "task workflow requirements clarifications design plan implementation diff "
+    "verification qa review feedback team agent_runs"
+).split()
 
 
 def _setup_logging() -> None:
@@ -82,6 +100,12 @@ def _apply_overrides(
     models = _role_overrides(role_model, "--role-model")
     known = known_runtimes()
     for role in Role:
+        # an explicit per-role override detaches the role from its fallback
+        # (planner → engineer, ux → product owner); otherwise it follows it
+        if role in runtimes or role in models:
+            config.agents.own(role)
+        if getattr(config.agents, role.value) is None:
+            continue
         agent = config.agents.for_role(role)
         agent.runtime = runtimes.get(role) or runtime or agent.runtime
         agent.model = models.get(role) or model or agent.model
@@ -125,6 +149,17 @@ def run(
     pr: Annotated[
         bool | None, typer.Option("--pr/--no-pr", help="Open a PR when the repo is on GitHub")
     ] = None,
+    workflow: Annotated[
+        str | None,
+        typer.Option(help="Workflow to run: bug | feature | ui_feature | refactor | <yours>"),
+    ] = None,
+    label: Annotated[
+        list[str] | None,
+        typer.Option(help="Task label, repeatable; picks the workflow like an issue label"),
+    ] = None,
+    quiet: Annotated[
+        bool, typer.Option("--quiet", "-q", help="Only print status changes, not artifacts")
+    ] = False,
 ) -> None:
     """Start a new task and drive it to a human gate or completion."""
 
@@ -156,25 +191,31 @@ def run(
         base_branch=base_branch or config.repo.base_branch,
         title=title,
         description=task_file.read_text(),
+        workflow=workflow,
+        labels=label or [],
     )
 
-    graph = build_graph(checkpointer=checkpointer())
-    thread = {"configurable": {"thread_id": task_id}}
-    initial = new_task_state(task, config, budget_usd=budget_usd)
-
+    try:
+        initial = new_task_state(task, config, budget_usd=budget_usd)
+    except DevLoopError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    chosen = initial.get("workflow")
+    assert chosen is not None
     team = "\n".join(
         f"  {role.value:<14} {a.runtime}" + (f" · {a.model}" if a.model else "")
-        for role in Role
+        for role in chosen.stages
         for a in [config.agents.for_role(role)]
     )
     rprint(
         Panel(
             f"task [bold]{task_id}[/bold]: {title}\n"
             f"repo: {task.repo}" + (f" @ {task.base_branch}" if task.base_branch else "") + "\n"
+            f"workflow: {render.workflow_line(chosen)}\n"
             f"team:\n{team}"
         )
     )
-    _drive(graph, initial, thread, task_id)
+    graph = build_graph(checkpointer=checkpointer())
+    _finish(drive(graph, initial, task_id, _printer(quiet)))
 
 
 def _team_pairs(config: DevLoopConfig) -> dict[tuple[str, str | None], list[str]]:
@@ -195,6 +236,11 @@ def _preflight(config: DevLoopConfig) -> None:
         for (runtime, model), roles in _team_pairs(config).items()
         if (problem := check_model(runtime, model))
     ]
+    for role in Role:
+        for name, server in config.agents.for_role(role).mcp_servers.items():
+            missing = [ref for ref in env_refs(server) if ref not in os.environ]
+            if missing:
+                problems.append(f"{role.value}: MCP server {name!r} needs {', '.join(missing)}")
     if problems:
         raise typer.BadParameter("\n".join(problems))
 
@@ -241,6 +287,98 @@ def probe(
         raise typer.Exit(1)
 
 
+@app.command()
+def watch(
+    repo: Annotated[
+        str | None, typer.Option(help="owner/name to watch (else github.repo / repo.url)")
+    ] = None,
+    once: Annotated[
+        bool, typer.Option(help="One poll: start what's eligible, wait for it, exit (cron)")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option(help="List eligible issues in pick order, with their workflow")
+    ] = False,
+    interval: Annotated[
+        int | None, typer.Option(help="Seconds between polls (config: poll_interval_s)", min=30)
+    ] = None,
+    max_concurrent: Annotated[
+        int | None, typer.Option(help="Tasks at once (config: github.max_concurrent)", min=1)
+    ] = None,
+) -> None:
+    """Run DevLoop on GitHub issues: poll for open issues with the configured
+    labels, run each through its workflow, and label/comment the outcome."""
+
+    from devloop.automation.watcher import Watcher
+    from devloop.sandbox.workspace import github_slug
+    from devloop.sources.github import to_task
+    from devloop.workflows import select_workflow
+
+    config = _load()
+    gh_config = config.github
+    if interval:
+        gh_config.poll_interval_s = interval
+    if max_concurrent:
+        gh_config.max_concurrent = max_concurrent
+    slug = repo or gh_config.repo or (github_slug(config.repo.url) if config.repo.url else None)
+    if not slug:
+        raise typer.BadParameter("no repo to watch: pass --repo, or set github.repo or repo.url")
+    source = config.repo.url if config.repo.url and github_slug(config.repo.url) == slug else None
+    source = source or f"https://github.com/{slug}.git"
+
+    _setup_logging()
+    graph = build_graph(checkpointer=checkpointer())
+
+    def run_task(task: TaskInput) -> Outcome:
+        def on_update(node: str, facts: dict[str, Any]) -> None:
+            logging.getLogger("devloop.watch").info(
+                "[%s] %s → %s", task.external_id, node, facts.get("status")
+            )
+
+        return drive(graph, new_task_state(task, config), task.external_id, on_update)
+
+    watcher = Watcher(config, repo=slug, repo_source=source, run_task=run_task)
+    if dry_run:
+        table = Table("#", "issue", "labels", "workflow", title=f"eligible in {slug}, pick order")
+        for i, issue in enumerate(watcher.candidates(), 1):
+            task = to_task(issue, task_id="-", repo_source=source, base_branch=None)
+            chosen = select_workflow(task, config.workflows, config.default_workflow)
+            table.add_row(
+                str(i),
+                f"#{issue.number} {issue.title}",
+                ", ".join(issue.labels),
+                f"{chosen.name} ({chosen.selected_by})",
+            )
+        rprint(table)
+        return
+
+    _preflight(config)
+    rprint(
+        Panel(
+            f"watching [bold]{slug}[/bold] for open issues labelled "
+            f"{', '.join(gh_config.labels) or '(any)'}\n"
+            f"every {gh_config.poll_interval_s}s, up to {gh_config.max_concurrent} at a time; "
+            f"clone: {source}"
+        )
+    )
+    watcher.setup()
+    if once:
+        started = watcher.poll()
+        rprint(
+            f"started {len(started)} issue(s)"
+            + (f": {', '.join(i.ref for i in started)}" if started else "")
+        )
+        watcher.wait()
+        return
+    try:
+        watcher.run_forever()
+    except KeyboardInterrupt:
+        rprint(
+            f"stopping — waiting for {len(watcher.running)} running task(s); Ctrl-C again aborts"
+        )
+        watcher.stop()
+        watcher.wait()
+
+
 @app.command("config")
 def show_config() -> None:
     """Print the effective configuration and where it came from."""
@@ -256,50 +394,113 @@ def resume(
     answer: Annotated[
         str, typer.Option(help="Answer for the gate: text at clarify, approve|cancel otherwise")
     ] = "",
+    quiet: Annotated[
+        bool, typer.Option("--quiet", "-q", help="Only print status changes, not artifacts")
+    ] = False,
 ) -> None:
     """Resume a task paused at a human gate."""
 
     _setup_logging()
     graph = build_graph(checkpointer=checkpointer())
-    config = {"configurable": {"thread_id": task_id}}
-    if not graph.get_state(config).values:
-        raise typer.BadParameter(f"no task with id {task_id}")
+    if not graph.get_state({"configurable": {"thread_id": task_id}}).values:
+        hint = (
+            " (it ran in LangGraph Studio: answer it there)" if records.load_state(task_id) else ""
+        )
+        raise typer.BadParameter(f"no task with id {task_id}{hint}")
     payload: object = {"answer": answer} if answer else "approve"
-    _drive(graph, Command(resume=payload), config, task_id)
+    outcome = drive(graph, Command(resume=payload), task_id, _printer(quiet))
+    _finish(outcome)
+    _report_to_issue(outcome)
+
+
+def _report_to_issue(outcome: Outcome) -> None:
+    """A task from `devloop watch` tells its issue where it ended up, however
+    it was resumed."""
+
+    from devloop.automation.watcher import report
+    from devloop.sources.github import parse_issue_url
+
+    task = outcome.values.get("task")
+    issue = parse_issue_url(task.url) if task is not None and task.source == "github" else None
+    if issue is not None:
+        report(_load().github, issue[0], issue[1], outcome)
+
+
+def _task_values(task_id: str) -> tuple[dict[str, Any], str]:
+    """The task's state from the CLI's checkpoints, else the record the
+    graph wrote — which is all there is for a task run in Studio."""
+
+    values = (
+        build_graph(checkpointer=checkpointer())
+        .get_state({"configurable": {"thread_id": task_id}})
+        .values
+    )
+    if values:
+        return dict(values), "checkpoint"
+    recorded = records.load_state(task_id)
+    if recorded:
+        return dict(recorded), "record (tasks/<id>/state.json)"
+    raise typer.BadParameter(f"no task with id {task_id}")
 
 
 @app.command()
-def show(task_id: Annotated[str, typer.Argument(help="Task id printed by `devloop run`")]) -> None:
-    """Status, cost and every agent run of a task."""
+def show(
+    task_id: Annotated[str, typer.Argument(help="Task id printed by `devloop run`")],
+    run: Annotated[
+        int | None,
+        typer.Option("--run", help="Print agent run #N's exact input (context) and output"),
+    ] = None,
+    field: Annotated[
+        str | None, typer.Option("--json", help=f"Dump one state field: {', '.join(_FIELDS)}")
+    ] = None,
+    events: Annotated[bool, typer.Option(help="Print the node-by-node timeline")] = False,
+    artifacts: Annotated[
+        bool, typer.Option(help="Print what each agent produced (--no-artifacts: just runs)")
+    ] = True,
+) -> None:
+    """Everything a task's agents produced and handed on, every agent run,
+    and its status — for tasks run from the CLI, `watch` or Studio."""
 
-    graph = build_graph(checkpointer=checkpointer())
-    values = graph.get_state({"configurable": {"thread_id": task_id}}).values
-    if not values:
-        raise typer.BadParameter(f"no task with id {task_id}")
+    values, source = _task_values(task_id)
+    if field is not None:
+        _dump_field(values, field)
+        return
+    if run is not None:
+        _show_run(values, run)
+        return
 
-    rprint(
-        Panel(
-            f"status: [bold]{values.get('status')}[/bold]\n"
-            f"pull request: {values.get('pull_request_url') or '—'}\n"
-            f"branch: {values.get('branch')}  base: {(values.get('base_commit') or '')[:10]}\n"
-            f"iteration: {values.get('iteration')}  replans: {values.get('replan_count')}\n"
-            f"cost: ${values.get('cost_usd', 0.0):.4f} of ${values.get('budget_usd') or 0:.2f}\n"
-            f"workspace: {workspace_dir(task_id)}"
-            + (
-                f"\n[red]escalation:[/red] {values['escalation_reason']}"
-                if values.get("escalation_reason")
-                else ""
-            ),
-            title=f"task {task_id}",
-        )
+    workflow = values.get("workflow")
+    header = [
+        f"status: [bold]{values.get('status')}[/bold]",
+        f"workflow: {render.workflow_line(workflow)}" if workflow else "workflow: feature (legacy)",
+        f"pull request: {values.get('pull_request_url') or '—'}",
+        f"branch: {values.get('branch')}  base: {(values.get('base_commit') or '')[:10]}",
+        f"iteration: {values.get('iteration')}  replans: {values.get('replan_count')}",
+        f"cost: ${values.get('cost_usd', 0.0):.4f} of ${values.get('budget_usd') or 0:.2f}",
+        f"workspace: {workspace_dir(task_id)}",
+        f"records: {task_dir(task_id)}  [dim](state from {source})[/dim]",
+    ]
+    if values.get("escalation_reason"):
+        header.append(f"[red]escalation:[/red] {values['escalation_reason']}")
+    rprint(Panel("\n".join(header), title=f"task {task_id}"))
+
+    if artifacts:
+        for panel in render.state(values):
+            console.print(panel)
+    if events:
+        _print_events(task_id)
+
+    table = Table(
+        "#", "step", "iter", "try", "runtime", "model", "prompt", "ok", "cost $", "tok in/out", "s"
     )
-    table = Table("step", "iter", "try", "runtime", "prompt", "ok", "cost $", "tokens in/out", "s")
-    for r in values.get("agent_runs", []):
+    for i, r in enumerate(values.get("agent_runs", []), 1):
         table.add_row(
+            str(i),
             r.step.value + (" ↻" if r.resumed else ""),
             str(r.iteration),
             str(r.attempt),
             r.runtime,
+            r.model or "—",
             r.prompt_version,
             "✓" if r.ok else f"✗ {r.error[:40]}",
             f"{r.cost_usd:.4f}",
@@ -307,21 +508,86 @@ def show(task_id: Annotated[str, typer.Argument(help="Task id printed by `devloo
             f"{r.duration_ms / 1000:.0f}",
         )
     rprint(table)
+    rprint(f"[dim]exact input/output of a run: devloop show {task_id} --run <#>[/dim]")
 
 
-def _drive(graph: Any, input_or_command: object, config: dict[str, Any], task_id: str) -> None:
-    for update in graph.stream(input_or_command, config, stream_mode="values"):
-        cost = update.get("cost_usd") or 0.0
-        rprint(f"[bold cyan]-> {update.get('status')}[/bold cyan]  [dim]${cost:.4f}[/dim]")
+def _dump_field(values: dict[str, Any], field: str) -> None:
+    if field not in _FIELDS:
+        raise typer.BadParameter(f"--json takes one of: {', '.join(_FIELDS)}")
+    value = values.get(field)
 
-    snapshot = graph.get_state(config)
-    if snapshot.next:
-        for task in snapshot.tasks:
-            for intr in task.interrupts:
-                rprint(Panel(_format_interrupt(intr.value), title="waiting on a human"))
-        rprint(f"resume with: [bold]devloop resume {task_id} --answer '...'[/bold]")
+    def plain(v: Any) -> Any:
+        if hasattr(v, "model_dump"):
+            return v.model_dump(mode="json")
+        if isinstance(v, list):
+            return [plain(x) for x in v]
+        return v
+
+    typer.echo(json.dumps(plain(value), indent=2))
+
+
+def _show_run(values: dict[str, Any], number: int) -> None:
+    runs = values.get("agent_runs", [])
+    if not 1 <= number <= len(runs):
+        raise typer.BadParameter(f"--run takes 1..{len(runs)}")
+    record = runs[number - 1]
+    rprint(
+        Panel(
+            f"{record.role.value} / {record.step.value}  iteration {record.iteration}, "
+            f"attempt {record.attempt}  {record.runtime} · {record.model or 'default model'}\n"
+            f"prompt {record.prompt_version}  ok: {record.ok}  {record.error}\n"
+            f"log: {record.log_path}",
+            title=f"run #{number}",
+        )
+    )
+    if not record.run_dir:
+        rprint("[yellow]this run predates per-run records; only its log exists[/yellow]")
+        return
+    run_dir = Path(record.run_dir)
+    for name, title in (("context.json", "input"), ("output.json", "output")):
+        path = run_dir / name
+        if path.exists():
+            console.print(Panel(Syntax(path.read_text(), "json", word_wrap=True), title=title))
+        else:
+            rprint(f"[yellow]{title}: no {name} (the agent wrote none)[/yellow]")
+    rprint(f"[dim]prompt: {run_dir / 'prompt.md'}[/dim]")
+
+
+def _print_events(task_id: str) -> None:
+    table = Table("time", "node", "→ status", "produced", "cost $", title="timeline")
+    for e in records.load_events(task_id):
+        table.add_row(
+            e["ts"][11:19], e["node"], e["status"], ", ".join(e["produced"]), f"{e['cost_usd']:.4f}"
+        )
+    rprint(table)
+
+
+# --- driving a task --------------------------------------------------------
+
+
+def _printer(quiet: bool) -> Any:
+    cost = 0.0
+
+    def on_update(node: str, facts: dict[str, Any]) -> None:
+        nonlocal cost
+        cost = facts.get("cost_usd", cost)
+        if quiet:
+            rprint(f"[bold cyan]-> {facts.get('status')}[/bold cyan]  [dim]${cost:.4f}[/dim]")
+            return
+        for item in render.update(node, facts, cost):
+            console.print(item)
+
+    return on_update
+
+
+def _finish(outcome: Outcome) -> None:
+    if outcome.waiting:
+        for gate in outcome.waiting:
+            rprint(Panel(_format_interrupt(gate), title="waiting on a human"))
+        rprint(f"resume with: [bold]devloop resume {outcome.task_id} --answer '...'[/bold]")
     else:
-        rprint(Panel(f"[bold green]done[/bold green]: {snapshot.values.get('status')}"))
+        rprint(Panel(f"[bold green]done[/bold green]: {outcome.status}"))
+    rprint(f"[dim]inspect: devloop show {outcome.task_id}[/dim]")
 
 
 def _format_interrupt(value: Any) -> str:

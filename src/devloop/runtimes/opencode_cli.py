@@ -41,8 +41,13 @@ class OpenCodeCLIAgent:
             "permission": {"edit": "allow", "bash": bash, "webfetch": "deny"},
         }
         if inv.tools.mcp_servers:
+            # passed via the environment, never written to disk
             config["mcp"] = {
-                s.name: {"type": "local", "command": list(s.command), "enabled": True}
+                s.name: (
+                    {"type": "remote", "url": s.url, "headers": dict(s.headers), "enabled": True}
+                    if s.url
+                    else {"type": "local", "command": list(s.command), "enabled": True}
+                )
                 for s in inv.tools.mcp_servers
             }
         return config

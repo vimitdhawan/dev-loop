@@ -9,10 +9,11 @@ Architecture context lives in [`architecture.md`](./architecture.md).
 | **1** | Sandbox + environment bootstrap | 🟡 Partial — per-task clone, `devloop.yml`, host-run baseline; Docker ⬜ |
 | **2** | Real agents (Reviewer → Planner → Requirement → Developer) | ✅ **Done** |
 | **3** | Agent team — PO / Engineer / QA / Reviewer, sessions, config, clone + PR | ✅ **Done** |
-| **4** | Human loop (scoped feedback, PR review comments, retry from escalation) | ⬜ Next |
-| **5** | Knowledge base | ⬜ |
-| **6** | Hardening + telemetry | ⬜ |
-| **v1** | GitHub App (webhooks, issues as tasks) | 🟡 PR sink done in Phase 3 |
+| **4** | Workflows per task type, Planner + UX stages, visible hand-offs, `devloop watch` | ✅ **Done** |
+| **5** | Human loop (scoped feedback, PR review comments, retry from escalation) | ⬜ Next |
+| **6** | Knowledge base | ⬜ |
+| **7** | Hardening + telemetry | ⬜ |
+| **v1** | GitHub App (webhooks, issues as tasks) | 🟡 PR sink (3), issue polling (4) done |
 | **v2** | Improvement engine | ⬜ |
 
 ---
@@ -359,9 +360,9 @@ Found by running real models:
 
 ## Known gaps → later phases
 
-- Crash-resume of an agent node re-runs the agent (double spend) — Phase 6.
-- Human feedback findings are never marked resolved — Phase 4 (`devloop feedback`).
-- `escalate` can only `cancel`; retry-from-here is Phase 4.
+- Crash-resume of an agent node re-runs the agent (double spend) — Phase 7.
+- Human feedback findings are never marked resolved — Phase 5 (`devloop feedback`).
+- `escalate` can only `cancel`; retry-from-here is Phase 5.
 - The Reviewer occasionally cites line numbers beyond the file's length;
   a cheap deterministic check is a candidate addition.
 
@@ -498,7 +499,99 @@ contract), not coding ability — confirm a candidate on a small real task.
 
 ---
 
-# Phase 4 — Human loop ⬜
+# Phase 4 — Workflows, hand-offs, issue automation ✅
+
+**Goal:** make agents communicate through explicit, visible state rather
+than shared conversations; run only the agents a task needs; and take
+tasks from GitHub issues continuously — without rewriting the Phase 3
+loop that was proven with real Claude runs.
+
+```
+issue ─► workflow ─► [PO] ─► [UX] ─► Planner ─► Engineer ─► checks ─► [QA] ─► Reviewer ─► PR
+                     each arrow: a validated document in state + on disk
+```
+
+## Design decisions
+
+- **One graph, workflow as a fact.** Rather than compiling a graph per
+  workflow, the chosen `Workflow` (name + stages) is stored in state and
+  `decide()` routes around the stages it doesn't list. Every workflow keeps
+  every guard, the routing table stays the single place to test, and a new
+  workflow is config, not code. Planner, Engineer and Reviewer are required.
+- **Selection is deterministic, not a model call:** `--workflow` → the first
+  workflow (config order, then built-ins) with a label the task carries →
+  `default_workflow`. Labels are the natural signal for issues; a triage
+  agent can be added later as one more way to set `task.workflow`.
+- **Planner is a role; the Engineer builds the checked plan.** Same
+  `engineer_plan` step (prompt dirs and stored records keep their names),
+  new `planner` role with its own session. The Engineer no longer shares the
+  planning conversation — it gets the plan through the context file, so the
+  plan document *is* the hand-off. `planner` / `ux` left out of the config
+  run as `engineer` / `product_owner`, so Phase 3 configs behave the same.
+- **UX is a contract, tools are config.** `DesignResult` (screens, states,
+  interactions, guidelines, references) is the hand-off; Stitch — or any
+  MCP server, local or remote — is attached per role under
+  `agents.<role>.mcp_servers`. Text first: later agents may not be able to
+  open a Stitch screen, so the document must be enough to build and test.
+- **Secrets never touch the config or the logs.** MCP headers use `${VAR}`,
+  resolved at launch; a missing variable fails preflight. Claude's per-run
+  MCP file is `0600` and deleted after the run; opencode gets it via env.
+- **The graph writes its own record.** Every node is wrapped to write
+  `tasks/<id>/state.json` and `events.jsonl`; the harness keeps each agent
+  attempt's exact `context.json`, `prompt.md` and `output.json`. Because the
+  graph writes it, it exists whether the task ran in the CLI, `watch` or
+  Studio's server — the shared surface Studio's separate checkpoint store
+  couldn't be.
+- **Watcher: one process, a thread pool, SQLite.** No queue or scheduler.
+  Double-processing is prevented by an atomic local claim (`BEGIN
+  IMMEDIATE`, held only while the claiming process is alive) plus the
+  `devloop:in-progress` label across machines (best effort, documented as
+  not a distributed lock). Outcome labels make re-runs an explicit human
+  act: remove the label.
+
+## What was built
+
+| Area | Files |
+|---|---|
+| Workflows | `workflows.py` (built-ins, validation, `select_workflow`), `contracts/runs.py` (`Workflow`, `Role.PLANNER`/`UX`), `graph/routing.py` (`workflow_of`, `_after_requirements`, PO-less `_consult`, QA skip) |
+| UX stage | `DesignResult` in `artifacts.py`, `DESIGNING` status, `design` node, `check_design`, `prompts/ux_design/v1.md` |
+| Planner split | `roles.PLAN` → `Role.PLANNER`; `prompts/engineer_plan/v2.md`, `engineer_implement/v2.md`; `qa`, `reviewer`, `po_answer` v2 know about design and PO-less workflows |
+| MCP per role | `McpServerConfig` (`command` or `url` + `headers`), `runtimes/base.py` `resolve_mcp`, claude `http` / opencode `remote` servers |
+| Visibility | `store/records.py` (state snapshot, events), harness `runs/` dirs + `AgentRunRecord.run_dir`, `cli/render.py` (one renderer per artifact), `graph/execute.py` (shared driver) |
+| CLI | `run --workflow --label -q`; `show --run N --json F --events` (falls back to the record for Studio tasks); `watch --once --dry-run` |
+| Issues | `gh.py`, `sources/github.py` (list, eligibility + order, labels, comments), `automation/claims.py`, `automation/watcher.py`; `resume` reports back to the issue; PR body says `Closes <issue>` |
+
+## Verified
+
+- 266 tests, no model calls: routing table **80 cases** (14 new for
+  workflows: PO-less, UX, UX questions, no-QA); workflow selection and
+  validation; team fallback; MCP resolution, `0600` + cleanup, opencode
+  remote; harness run records; end to end — bug skips the PO, no-QA never
+  enters QA, UI hands the design to Planner and Engineer, UX question → PO
+  → UX resumes, PO-less question → human, the record matches the
+  checkpoint; watcher against a fake `gh` — eligibility, priority/age/number
+  order, `max_concurrent`, a live claim blocks, a dead one is reclaimable,
+  8 threads racing for one issue (1 wins), a crash labels `failed`, orphans
+  flagged `needs-human` at startup; CLI — live panels, quiet mode, `show
+  --run/--json/--events`, Studio fallback, `watch --dry-run` order.
+- `langgraph dev` (0.15): a Studio run with `"labels": ["bug"]` picked the
+  `bug` workflow, skipped the PO, reached `READY_FOR_FINALIZE`, and
+  `devloop show <id>` rendered it from the record.
+- `ruff`, `ruff format`, `mypy --strict` (src **and** tests) clean.
+
+## Not done → next
+
+- **No real-model run yet** of the new prompts (Planner v2, Engineer v2,
+  UX v1) or of Stitch — only stubs. First real runs: one `bug` and one
+  `ui_feature` task on a throwaway repo, then compare plan quality and cost
+  with Phase 3's `$0.48` baseline.
+- `devloop watch` not yet run against github.com (fake `gh` only).
+- Answering a gate from an issue comment (needs the GitHub App, v1).
+- Workflow chosen by a triage agent when an issue has no mapped label.
+
+---
+
+# Phase 5 — Human loop ⬜
 
 - `devloop feedback` mapping free text to `Finding` objects
 - Scoped feedback — re-open one finding, not the whole change
@@ -510,7 +603,7 @@ reviewable requirements/plan/evidence summary landed in Phases 2–3.)*
 
 ---
 
-# Phase 5 — Knowledge base ⬜
+# Phase 6 — Knowledge base ⬜
 
 - `repo_knowledge` store with confidence, provenance, decay
 - `harvest_knowledge` node after every task
@@ -520,7 +613,7 @@ reviewable requirements/plan/evidence summary landed in Phases 2–3.)*
 
 ---
 
-# Phase 6 — Hardening + telemetry ⬜
+# Phase 7 — Hardening + telemetry ⬜
 
 - Budget and iteration enforcement under real cost accounting
 - Retry/backoff on CLI failures

@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from devloop.agents import roles
 from devloop.contracts.artifacts import EnvRecipe
-from devloop.contracts.runs import Role, Step
-from devloop.runtimes.base import AgentInvocation, McpServer, ToolPolicy
+from devloop.contracts.runs import McpServerConfig, Role, Step
+from devloop.errors import AgentError
+from devloop.runtimes.base import AgentInvocation, McpServer, ToolPolicy, resolve_mcp
 from devloop.runtimes.claude_cli import ClaudeCLIAgent, parse_result
 from devloop.runtimes.opencode_cli import OpenCodeCLIAgent, parse_events
 
@@ -174,4 +177,76 @@ def test_opencode_resume_and_mcp(tmp_path: Path) -> None:
     assert argv[argv.index("--session") + 1] == "ses_1"
     assert config["mcp"] == {
         "playwright": {"type": "local", "command": ["npx", "pw"], "enabled": True}
+    }
+
+
+# --- remote MCP servers (e.g. Stitch for UX) --------------------------------
+
+STITCH = McpServer(
+    "stitch", url="https://stitch.example/mcp", headers=(("X-Goog-Api-Key", "secret-1"),)
+)
+
+
+def test_resolve_mcp_reads_header_secrets_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = McpServerConfig(url="https://s/mcp", headers={"X-Key": "Bearer ${STITCH_KEY}"})
+
+    monkeypatch.delenv("STITCH_KEY", raising=False)
+    with pytest.raises(AgentError, match="STITCH_KEY"):
+        resolve_mcp("stitch", config)
+
+    monkeypatch.setenv("STITCH_KEY", "abc")
+    server = resolve_mcp("stitch", config)
+    assert server.headers == (("X-Key", "Bearer abc"),)
+    assert config.headers["X-Key"] == "Bearer ${STITCH_KEY}", "config keeps the reference"
+
+
+def test_claude_remote_mcp_config_is_private_and_removed_after_the_run(tmp_path: Path) -> None:
+    fake = tmp_path / "claude"
+    seen = tmp_path / "seen.json"
+    # the fake CLI copies the MCP config it was given, then reports success
+    fake.write_text(
+        "#!/bin/sh\n"
+        'while [ "$1" != "--mcp-config" ]; do shift; done\n'
+        f'cp "$2" {seen}\n'
+        """echo '{"is_error": false, "total_cost_usd": 0, "session_id": "s"}'\n"""
+    )
+    fake.chmod(0o755)
+    inv = AgentInvocation(
+        role=Role.UX,
+        step=Step.DESIGN,
+        prompt="p",
+        workdir=tmp_path,
+        tools=ToolPolicy(mcp_servers=(STITCH,)),
+        log_path=tmp_path / "logs" / "ux.log",
+    )
+    agent = ClaudeCLIAgent(str(fake))
+
+    assert "mcp__stitch" in agent.build_argv(inv)
+    assert oct(agent.write_mcp_config(inv).stat().st_mode & 0o777) == "0o600"
+    outcome = agent.run(inv)
+
+    assert outcome.ok
+    server = json.loads(seen.read_text())["mcpServers"]["stitch"]
+    assert server == {
+        "type": "http",
+        "url": "https://stitch.example/mcp",
+        "headers": {"X-Goog-Api-Key": "secret-1"},
+    }
+    assert not agent.mcp_config_path(inv).exists(), "no credentials left next to the logs"
+
+
+def test_opencode_remote_mcp_goes_through_the_environment_only() -> None:
+    config = OpenCodeCLIAgent("opencode").permission_config(
+        invocation(ToolPolicy(mcp_servers=(STITCH,)))
+    )
+
+    assert config["mcp"] == {
+        "stitch": {
+            "type": "remote",
+            "url": "https://stitch.example/mcp",
+            "headers": {"X-Goog-Api-Key": "secret-1"},
+            "enabled": True,
+        }
     }

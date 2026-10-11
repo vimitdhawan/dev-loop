@@ -86,6 +86,20 @@ def _po_answer(ws: Path, ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _design(ws: Path, ctx: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": f"Design for: {ctx['task']['title']}",
+        "screens": [
+            {
+                "name": "notes panel",
+                "purpose": "show what DevLoop did",
+                "layout": ["heading", "list of notes"],
+                "states": ["empty: 'No notes yet'"],
+            }
+        ],
+    }
+
+
 def _plan(ws: Path, ctx: dict[str, Any]) -> dict[str, Any]:
     return {
         "summary": f"Plan for: {ctx['task']['title']}",
@@ -122,6 +136,7 @@ def _review(ws: Path, ctx: dict[str, Any]) -> dict[str, Any]:
 _DEFAULTS = {
     Step.REQUIREMENTS: _requirements,
     Step.PO_ANSWER: _po_answer,
+    Step.DESIGN: _design,
     Step.PLAN: _plan,
     Step.IMPLEMENT: _implement,
     Step.QA: _qa,

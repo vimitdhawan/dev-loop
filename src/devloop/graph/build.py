@@ -18,11 +18,13 @@ from langgraph.graph import END, StateGraph
 from devloop.contracts.state import DevLoopState
 from devloop.contracts.status import DevLoopStatus as St
 from devloop.graph.nodes import core
+from devloop.store.records import recorded
 
 STATUS_TO_NODE: dict[St, str] = {
     St.RECEIVED: "ingest",
     St.CLARIFICATION_REQUIRED: "clarify",
     St.CONSULTING_PO: "consult_po",
+    St.DESIGNING: "design",
     St.PLANNING: "plan",
     St.PLAN_READY: "env_gate",
     St.ENV_BOOTSTRAP: "env_bootstrap",
@@ -54,6 +56,7 @@ NODE_FUNCS = {
     "ingest": core.ingest,
     "clarify": core.clarify,
     "consult_po": core.consult_po,
+    "design": core.design,
     "plan": core.plan,
     "env_gate": core.env_gate,
     "env_bootstrap": core.env_bootstrap,
@@ -76,7 +79,8 @@ def build_graph(checkpointer: BaseCheckpointSaver[Any] | None = None) -> Any:
 
     builder = StateGraph(DevLoopState)
     for name, fn in NODE_FUNCS.items():
-        builder.add_node(name, fn)
+        # every node's result also lands in tasks/<id>/ (state.json, events)
+        builder.add_node(name, recorded(name, fn))
 
     builder.set_entry_point("ingest")
 

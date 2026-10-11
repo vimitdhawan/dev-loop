@@ -3,15 +3,22 @@
 | Role          | Steps                   | Session                         |
 |---------------|-------------------------|---------------------------------|
 | Product Owner | requirements, po_answer | kept for the task               |
-| Engineer      | plan, implement (+fix)  | kept for the task               |
+| UX            | design                  | kept for the task               |
+| Planner       | plan (+replan)          | kept for the task               |
+| Engineer      | implement (+fix)        | kept for the task               |
 | QA            | qa                      | kept across retests             |
 | Reviewer      | review                  | **fresh every time**            |
+
+A session only carries a role's memory of its *own* work. Everything one
+role hands another — requirements, design, plan, findings — goes through
+state and the context file, so each hand-off is visible and replaceable.
 """
 
 from __future__ import annotations
 
 from devloop.agents.harness import StepSpec
 from devloop.contracts.artifacts import (
+    DesignResult,
     EnvRecipe,
     ImplementationResult,
     PlanResult,
@@ -26,15 +33,18 @@ from devloop.runtimes.base import READ_ONLY_SHELL, McpServer, ToolPolicy
 _READ_ONLY = ToolPolicy(can_edit=False, bash_allow=READ_ONLY_SHELL)
 
 # Roles whose agent session is resumed across steps.
-SESSION_ROLES = frozenset({Role.PRODUCT_OWNER, Role.ENGINEER, Role.QA})
+SESSION_ROLES = frozenset({Role.PRODUCT_OWNER, Role.UX, Role.PLANNER, Role.ENGINEER, Role.QA})
 
 REQUIREMENTS = StepSpec(
     Role.PRODUCT_OWNER, Step.REQUIREMENTS, RequirementResult, _READ_ONLY, timeout_s=600
 )
 PO_ANSWER = StepSpec(Role.PRODUCT_OWNER, Step.PO_ANSWER, POAnswer, _READ_ONLY, timeout_s=600)
-# Planning is read-only even though the same session implements next: the
-# plan is checked before a single file changes.
-PLAN = StepSpec(Role.ENGINEER, Step.PLAN, PlanResult, _READ_ONLY, timeout_s=900)
+# UX may save design files (e.g. exported from Stitch) under `.devloop/out/`;
+# its design tools come from the role's `mcp_servers` config.
+DESIGN = StepSpec(Role.UX, Step.DESIGN, DesignResult, _READ_ONLY, timeout_s=20 * 60)
+# Read-only: the plan is checked before a single file changes, and the
+# Engineer builds from the checked plan — not from the Planner's session.
+PLAN = StepSpec(Role.PLANNER, Step.PLAN, PlanResult, _READ_ONLY, timeout_s=900)
 REVIEW = StepSpec(Role.REVIEWER, Step.REVIEW, ReviewResult, _READ_ONLY, timeout_s=900)
 
 

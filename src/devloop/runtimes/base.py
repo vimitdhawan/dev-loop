@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -18,7 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from devloop.contracts.runs import Role, Step
+from devloop.contracts.runs import McpServerConfig, Role, Step
+from devloop.errors import AgentError
 
 log = logging.getLogger("devloop.agent")
 
@@ -45,10 +47,41 @@ READ_ONLY_SHELL = (
 
 @dataclass(frozen=True)
 class McpServer:
-    """A local stdio MCP server the agent gets, e.g. Playwright for QA."""
+    """An MCP server the agent gets: local stdio (`command`, e.g. Playwright
+    for QA) or remote HTTP (`url`, e.g. Stitch for UX). `headers` hold
+    resolved values — possibly secrets — so adapters must never log them
+    or leave them on disk after the run."""
 
     name: str
-    command: tuple[str, ...]
+    command: tuple[str, ...] = ()
+    url: str | None = None
+    headers: tuple[tuple[str, str], ...] = ()
+
+
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def env_refs(config: McpServerConfig) -> list[str]:
+    """Environment variables a server's headers need."""
+
+    return [m for value in config.headers.values() for m in _ENV_REF.findall(value)]
+
+
+def resolve_mcp(name: str, config: McpServerConfig) -> McpServer:
+    """Config → server, substituting `${NAME}` in header values from the
+    environment at launch time. A missing variable fails the step rather
+    than connecting without credentials."""
+
+    missing = [ref for ref in env_refs(config) if ref not in os.environ]
+    if missing:
+        raise AgentError(f"MCP server {name!r} needs environment variable(s) {', '.join(missing)}")
+    headers = tuple(
+        (key, _ENV_REF.sub(lambda m: os.environ[m.group(1)], value))
+        for key, value in config.headers.items()
+    )
+    return McpServer(
+        name=name, command=tuple(config.command or ()), url=config.url, headers=headers
+    )
 
 
 @dataclass(frozen=True)

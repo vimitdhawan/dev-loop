@@ -75,24 +75,37 @@ class ClaudeCLIAgent:
             argv += ["--max-budget-usd", f"{inv.max_budget_usd:.2f}"]
         return argv
 
+    def mcp_config_path(self, inv: AgentInvocation) -> Path:
+        return inv.log_path.with_suffix(".mcp.json")
+
     def write_mcp_config(self, inv: AgentInvocation) -> Path:
-        path = inv.log_path.with_suffix(".mcp.json")
+        path = self.mcp_config_path(inv)
         path.parent.mkdir(parents=True, exist_ok=True)
-        servers = {
-            s.name: {"command": s.command[0], "args": list(s.command[1:])}
-            for s in inv.tools.mcp_servers
-        }
-        path.write_text(json.dumps({"mcpServers": servers}, indent=2))
+        servers: dict[str, dict[str, object]] = {}
+        for s in inv.tools.mcp_servers:
+            if s.url:
+                servers[s.name] = {"type": "http", "url": s.url, "headers": dict(s.headers)}
+            else:
+                servers[s.name] = {"command": s.command[0], "args": list(s.command[1:])}
+        # owner-only: header values can be credentials
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps({"mcpServers": servers}, indent=2))
         return path
 
     def run(self, invocation: AgentInvocation) -> AgentOutcome:
-        code, out, err = run_process(
-            self.build_argv(invocation),
-            stdin=invocation.prompt,  # stdin, not argv: no length limit, no flag parsing
-            cwd=invocation.workdir,
-            timeout_s=invocation.timeout_s,
-            log_path=invocation.log_path,
-        )
+        try:
+            code, out, err = run_process(
+                self.build_argv(invocation),
+                stdin=invocation.prompt,  # stdin, not argv: no length limit, no flag parsing
+                cwd=invocation.workdir,
+                timeout_s=invocation.timeout_s,
+                log_path=invocation.log_path,
+            )
+        finally:
+            if any(s.headers for s in invocation.tools.mcp_servers):
+                # don't leave credentials next to the logs
+                self.mcp_config_path(invocation).unlink(missing_ok=True)
         return parse_result(code, out, err)
 
 

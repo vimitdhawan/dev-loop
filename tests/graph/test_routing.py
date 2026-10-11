@@ -8,11 +8,12 @@ skip a gate no matter what an agent's prose says.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from devloop.contracts.artifacts import (
+    DesignResult,
     Deviation,
     EnvRecipe,
     Finding,
@@ -31,6 +32,7 @@ from devloop.contracts.artifacts import (
     TestRunResult,
     Verdict,
 )
+from devloop.contracts.runs import Role, Workflow
 from devloop.contracts.state import DevLoopState, DiffSummary
 from devloop.contracts.status import DevLoopStatus as St
 from devloop.graph.routing import decide
@@ -48,7 +50,7 @@ def make_state(status: St, **overrides: Any) -> DevLoopState:
         "feedback": [],
         "qa": QA_PASSED,
     }
-    base.update(overrides)
+    base.update(cast(DevLoopState, overrides))
     return base
 
 
@@ -117,6 +119,19 @@ def implementation(plan_invalid: bool = False) -> ImplementationResult:
 
 
 _PLAN = PlanResult(summary="p")
+_DESIGN = DesignResult(summary="d")
+
+P, U, PL, E, Q, R = (
+    Role.PRODUCT_OWNER,
+    Role.UX,
+    Role.PLANNER,
+    Role.ENGINEER,
+    Role.QA,
+    Role.REVIEWER,
+)
+BUG = Workflow(name="bug", stages=[PL, E, Q, R])
+UI = Workflow(name="ui_feature", stages=[P, U, PL, E, Q, R])
+NO_QA = Workflow(name="docs", stages=[PL, E, R])
 
 CASES: list[tuple[str, DevLoopState, St]] = [
     (
@@ -533,6 +548,89 @@ CASES: list[tuple[str, DevLoopState, St]] = [
         "publishing goes to the human gate",
         make_state(St.PUBLISHING),
         St.READY_FOR_FINALIZE,
+    ),
+    # --- workflows ----------------------------------------------------------
+    (
+        "a workflow without a Product Owner plans straight from the task",
+        make_state(St.RECEIVED, workflow=BUG),
+        St.PLANNING,
+    ),
+    (
+        "a UI workflow designs once the requirements are ready",
+        make_state(St.RECEIVED, workflow=UI, requirements=req(RequirementStatus.READY)),
+        St.DESIGNING,
+    ),
+    (
+        "a UI workflow still clarifies unready requirements first",
+        make_state(
+            St.RECEIVED, workflow=UI, requirements=req(RequirementStatus.NEEDS_CLARIFICATION)
+        ),
+        St.CLARIFICATION_REQUIRED,
+    ),
+    (
+        "a design hands over to planning",
+        make_state(St.DESIGNING, workflow=UI, design=_DESIGN),
+        St.PLANNING,
+    ),
+    (
+        "designing stays put until there is a design",
+        make_state(St.DESIGNING, workflow=UI),
+        St.DESIGNING,
+    ),
+    (
+        "UX questions go to the Product Owner",
+        make_state(St.DESIGNING, workflow=UI, pending_questions=["which colour?"]),
+        St.CONSULTING_PO,
+    ),
+    (
+        "the Product Owner's answer returns to designing",
+        make_state(St.CONSULTING_PO, workflow=UI, consult_return=St.DESIGNING),
+        St.DESIGNING,
+    ),
+    (
+        "a human's answer returns to designing",
+        make_state(
+            St.CLARIFICATION_REQUIRED,
+            workflow=UI,
+            requirements=req(RequirementStatus.READY),
+            consult_return=St.DESIGNING,
+        ),
+        St.DESIGNING,
+    ),
+    (
+        "without a Product Owner, a planner's question goes to a human",
+        make_state(St.PLANNING, workflow=BUG, pending_questions=["which API?"]),
+        St.CLARIFICATION_REQUIRED,
+    ),
+    (
+        "without a Product Owner, the human's answer returns to the asker",
+        make_state(St.CLARIFICATION_REQUIRED, workflow=BUG, consult_return=St.IMPLEMENTING),
+        St.IMPLEMENTING,
+    ),
+    (
+        "a workflow without QA goes from green checks to review",
+        make_state(St.TESTING, workflow=NO_QA, qa=None),
+        St.REVIEWING,
+    ),
+    (
+        "a workflow without QA still sends red checks back",
+        make_state(
+            St.TESTING,
+            workflow=NO_QA,
+            qa=None,
+            verification=[make_test_run("t", passed=False)],
+        ),
+        St.CHANGES_REQUIRED,
+    ),
+    (
+        "a workflow without QA publishes on review approval alone",
+        make_state(St.REVIEWING, workflow=NO_QA, qa=None, review=review(Verdict.APPROVED)),
+        St.PUBLISHING,
+    ),
+    (
+        "a workflow with QA still needs QA's pass",
+        make_state(St.REVIEWING, workflow=BUG, qa=None, review=review(Verdict.APPROVED)),
+        St.CHANGES_REQUIRED,
     ),
 ]
 

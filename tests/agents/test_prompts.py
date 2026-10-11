@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ def test_every_step_has_a_prompt_that_renders(step: Step) -> None:
 
     text = prompt.render(context_path="CTX", out_path="OUT", schema="SCHEMA")
 
-    assert prompt.version.startswith("v1+")
+    assert re.match(r"v\d+\+[0-9a-f]{8}$", prompt.version)
     assert "OUT" in text and "SCHEMA" in text and "$" not in text
 
 

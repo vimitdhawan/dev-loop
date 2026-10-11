@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from devloop.contracts.artifacts import (
     Clarification,
+    DesignResult,
     Deviation,
     EnvRecipe,
     Finding,
@@ -25,7 +26,7 @@ from devloop.contracts.artifacts import (
     ReviewResult,
     TestRunResult,
 )
-from devloop.contracts.runs import AgentRunRecord, PullRequestConfig, TeamConfig
+from devloop.contracts.runs import AgentRunRecord, PullRequestConfig, TeamConfig, Workflow
 from devloop.contracts.status import DevLoopStatus
 
 BUDGET_USD_DEFAULT = 20.0
@@ -35,11 +36,11 @@ MAX_PO_CONSULTATIONS = 3
 
 
 class TaskInput(BaseModel):
-    """What a source (local CLI in v0, GitHub App later) hands the graph to
-    start a task."""
+    """What a source (local CLI, LangGraph Studio, a GitHub issue) hands
+    the graph to start a task."""
 
     external_id: str
-    source: str = "local"
+    source: str = "local"  # "local" | "studio" | "github"
     # A local path or a clone URL. Either way the task works in a fresh
     # clone; the user's checkout is never touched.
     repo: str
@@ -47,6 +48,12 @@ class TaskInput(BaseModel):
     base_branch: str | None = None
     title: str
     description: str
+    # Workflow asked for by name (`--workflow bug`); None = pick from labels.
+    workflow: str | None = None
+    # The issue's labels — what picks the workflow when none is named.
+    labels: list[str] = []
+    # Where the task came from, e.g. the issue's URL; linked from the PR.
+    url: str | None = None
 
 
 class DiffSummary(BaseModel):
@@ -59,6 +66,9 @@ class DiffSummary(BaseModel):
 class DevLoopState(TypedDict, total=False):
     task: TaskInput
     status: DevLoopStatus
+    # Which stages this task goes through; None (a task started before
+    # workflows existed) = the full feature workflow.
+    workflow: Workflow | None
     team: TeamConfig
     pull_request: PullRequestConfig
 
@@ -67,9 +77,10 @@ class DevLoopState(TypedDict, total=False):
     base_branch: str | None
     base_commit: str | None
     branch: str | None
-    # role -> agent session id, so the Product Owner, Engineer and QA each
-    # keep their context across steps. The Reviewer is never stored here:
-    # every review starts fresh.
+    # role -> agent session id, so a role keeps its context across its own
+    # steps (the Engineer across fixes, QA across retests). What one role
+    # hands the next always goes through state, never a shared session. The
+    # Reviewer is never stored here: every review starts fresh.
     sessions: dict[str, str]
 
     requirements: RequirementResult | None
@@ -79,6 +90,9 @@ class DevLoopState(TypedDict, total=False):
     consult_return: DevLoopStatus | None
     po_consultations: int
     clarifications: Annotated[list[Clarification], operator.add]
+
+    # The UX stage's hand-off to the Planner (UI workflows only).
+    design: DesignResult | None
 
     plan: PlanResult | None
     # Why the last plan was abandoned; handed to the Engineer on a replan.

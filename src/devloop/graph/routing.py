@@ -8,6 +8,10 @@ and `decide()` looks at what they produced.
 
 Keeping this pure is what makes it table-testable, and table tests are
 what let you change the policy with confidence instead of vibes.
+
+The task's `Workflow` is one of those facts: a stage it doesn't list (no
+Product Owner for a bug, no UX outside UI work, no QA) is routed around
+here, so every workflow runs through the same graph and the same guards.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from devloop.contracts.artifacts import (
     TestRunResult,
     Verdict,
 )
+from devloop.contracts.runs import Role, Workflow
 from devloop.contracts.state import (
     MAX_PO_CONSULTATIONS,
     MAX_REPLANS,
@@ -30,12 +35,21 @@ from devloop.contracts.state import (
     DevLoopState,
 )
 from devloop.contracts.status import DevLoopStatus as St
+from devloop.workflows import LEGACY
 
 
 def _budget_exceeded(state: DevLoopState) -> bool:
     budget = state.get("budget_usd")
     cost = state.get("cost_usd", 0.0)
     return budget is not None and cost >= budget
+
+
+def workflow_of(state: DevLoopState) -> Workflow:
+    return state.get("workflow") or LEGACY
+
+
+def _has(state: DevLoopState, role: Role) -> bool:
+    return workflow_of(state).has(role)
 
 
 def decide(state: DevLoopState) -> St:
@@ -55,11 +69,18 @@ def decide(state: DevLoopState) -> St:
             if state.get("pending_questions"):
                 return St.CLARIFICATION_REQUIRED
             req = state.get("requirements")
-            if req is not None and req.status == RequirementStatus.READY:
-                # a human answering an Engineer's question returns to the
-                # step that asked; the initial clarification goes to planning
-                return state.get("consult_return") or St.PLANNING
+            if not _has(state, Role.PRODUCT_OWNER) or (
+                req is not None and req.status == RequirementStatus.READY
+            ):
+                # a human answering a question returns to the step that
+                # asked; otherwise the requirements are done
+                return state.get("consult_return") or _after_requirements(state)
             return St.CLARIFICATION_REQUIRED
+
+        case St.DESIGNING:
+            if state.get("pending_questions"):
+                return _consult(state)
+            return St.PLANNING if state.get("design") else St.DESIGNING
 
         case St.CONSULTING_PO:
             if state.get("pending_questions"):
@@ -111,7 +132,9 @@ def decide(state: DevLoopState) -> St:
         case St.TESTING:
             # Red checks go straight back to the Engineer: browser-testing
             # or reviewing a change that already fails is wasted spend.
-            return St.CHANGES_REQUIRED if new_failure_keys(state) else St.QA_TESTING
+            if new_failure_keys(state):
+                return St.CHANGES_REQUIRED
+            return St.QA_TESTING if _has(state, Role.QA) else St.REVIEWING
 
         case St.QA_TESTING:
             qa = state.get("qa")
@@ -159,10 +182,19 @@ def decide(state: DevLoopState) -> St:
     raise ValueError(f"decide(): no rule for status {status!r}")
 
 
-def _consult(state: DevLoopState) -> St:
-    """The Engineer asked a question. The Product Owner answers it — within
-    a cap, so two agents can't ping-pong a task's budget away."""
+def _after_requirements(state: DevLoopState) -> St:
+    if _has(state, Role.UX) and state.get("design") is None:
+        return St.DESIGNING
+    return St.PLANNING
 
+
+def _consult(state: DevLoopState) -> St:
+    """An agent asked a question. The Product Owner answers it — within a
+    cap, so two agents can't ping-pong a task's budget away. A workflow
+    without a Product Owner asks a human straight away."""
+
+    if not _has(state, Role.PRODUCT_OWNER):
+        return St.CLARIFICATION_REQUIRED
     if state.get("po_consultations", 0) < MAX_PO_CONSULTATIONS:
         return St.CONSULTING_PO
     return St.ESCALATED
@@ -170,8 +202,10 @@ def _consult(state: DevLoopState) -> St:
 
 def _qa_ok(state: DevLoopState) -> bool:
     """The Reviewer has the final say, but only on a change QA passed (or
-    that has no app to test)."""
+    that has no app to test, or a workflow without QA)."""
 
+    if not _has(state, Role.QA):
+        return True
     qa = state.get("qa")
     return qa is not None and qa.verdict in (QAVerdict.PASSED, QAVerdict.SKIPPED)
 

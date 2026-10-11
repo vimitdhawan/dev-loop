@@ -1,16 +1,22 @@
 """Graph node implementations — the team at work.
 
-    Product Owner ──► Engineer: plan ──► (plan check) ──► Engineer: implement
-          ▲   questions │                                  │ questions
-          └─────────────┴──────────────────────────────────┘
-    implement ──► checks ──► QA (browser) ──► Reviewer (fresh) ──► publish/PR
-        ▲            │ red        │ bugs            │ changes
-        └────────────┴────────────┴─────────────────┘
+    Product Owner ─► UX ─► Planner ─► (plan check) ─► Engineer
+          ▲  questions │       │                         │
+          └────────────┴───────┴─────────────────────────┘
+    Engineer ─► checks ─► QA (browser) ─► Reviewer (fresh) ─► publish/PR
+        ▲          │ red       │ bugs           │ changes
+        └──────────┴───────────┴────────────────┘
 
-Agents never talk to each other directly. An Engineer's question is a
-field in its output document; the orchestrator routes it to the Product
-Owner's session (or to a human) and resumes the Engineer's session with
-the answer. Every hand-off is a stored fact.
+Which of the optional stages (Product Owner, UX, QA) run is the task's
+workflow, a fact `decide()` routes on; nodes don't check it.
+
+Agents never talk to each other directly, and never inherit each other's
+conversations. Each one's validated output document becomes a state field
+(`requirements`, `design`, `plan`, `implementation`, `qa`, `review`) that
+the next one is handed in its context file. A question is a field too: the
+orchestrator routes it to the Product Owner's session (or to a human) and
+resumes the asker's session with the answer. Every hand-off is a stored
+fact.
 
 Node granularity follows LangGraph's re-execution rule: `interrupt()`
 re-runs its node from the top on resume, so `clarify`, `finalize` and
@@ -35,6 +41,7 @@ from langgraph.types import interrupt
 
 from devloop.agents import roles
 from devloop.agents.checks import (
+    check_design,
     check_implementation,
     check_plan,
     check_po_answer,
@@ -54,7 +61,7 @@ from devloop.contracts.artifacts import (
     Severity,
 )
 from devloop.contracts.context import DevelopmentContext, VerificationSummary
-from devloop.contracts.runs import PullRequestConfig, TeamConfig
+from devloop.contracts.runs import PullRequestConfig, Role, TeamConfig
 from devloop.contracts.state import DevLoopState, DiffSummary
 from devloop.contracts.status import DevLoopStatus as St
 from devloop.env.app import AppEnvironmentError, AppError, running_app
@@ -68,6 +75,7 @@ from devloop.graph.routing import (
     latest_verification,
     new_failure_keys,
     open_findings,
+    workflow_of,
 )
 from devloop.paths import task_dir
 from devloop.runtimes.base import IN_DIR
@@ -131,8 +139,10 @@ def _context(state: DevLoopState, spec: StepSpec[Any], **extra: Any) -> Developm
         iteration=extra.pop("iteration", state.get("iteration", 0)),
         base_commit=state.get("base_commit") or "",
         branch=state.get("branch") or "",
+        workflow=workflow_of(state),
         requirements=state.get("requirements"),
         clarifications=state.get("clarifications", []),
+        design=state.get("design"),
         plan=state.get("plan"),
         commands=_commands(state),
         **extra,
@@ -178,6 +188,14 @@ def _ask_po(status: St, questions: list[str]) -> dict[str, Any]:
 
 
 _ANSWERED: dict[str, Any] = {"pending_questions": [], "consult_return": None}
+
+# who is waiting on an answer, by the status they'll return to
+_ASKER = {
+    St.DESIGNING: Role.UX.value,
+    St.PLANNING: Role.PLANNER.value,
+    St.REPLANNING: Role.PLANNER.value,
+    St.IMPLEMENTING: Role.ENGINEER.value,
+}
 
 
 def _verification_summaries(state: DevLoopState) -> list[VerificationSummary]:
@@ -253,6 +271,9 @@ def ingest(state: DevLoopState) -> dict[str, Any]:
         "branch": ws.branch,
     }
     state = _with(state, **facts)
+    if not workflow_of(state).has(Role.PRODUCT_OWNER):
+        # e.g. a bug: the issue itself is the spec, the Planner starts from it
+        return _advance(state, **facts)
 
     spec = roles.REQUIREMENTS
     run = _run(state, spec, _context(state, spec), check_requirements)
@@ -270,14 +291,22 @@ def clarify(state: DevLoopState) -> dict[str, Any]:
 
     pending = state.get("pending_questions", [])
     req = state.get("requirements")
-    if not pending and req is not None and req.status == RequirementStatus.READY:
+    if not pending and (
+        (req is not None and req.status == RequirementStatus.READY)
+        or not workflow_of(state).has(Role.PRODUCT_OWNER)
+    ):
         return _advance(state)
 
     questions = pending or (req.questions if req else [])
+    asked_by = Role.PRODUCT_OWNER.value
+    if pending:
+        asked_by = _ASKER.get(state.get("consult_return") or St.PLANNING, "the team")
+        if workflow_of(state).has(Role.PRODUCT_OWNER):
+            asked_by += " (via product owner)"
     payload = interrupt(
         {
             "gate": "clarify",
-            "asked_by": "engineer (via product owner)" if pending else "product owner",
+            "asked_by": asked_by,
             "task": state["task"].title,
             "questions": questions,
         }
@@ -303,8 +332,9 @@ def clarify(state: DevLoopState) -> dict[str, Any]:
 
 @_escalate_on_error
 def consult_po(state: DevLoopState) -> dict[str, Any]:
-    """The Product Owner answers the Engineer, in its own session — it
-    still remembers exploring the task when it wrote the requirements."""
+    """The Product Owner answers whoever asked (UX, Planner or Engineer),
+    in its own session — it still remembers exploring the task when it
+    wrote the requirements."""
 
     questions = state.get("pending_questions", [])
     spec = roles.PO_ANSWER
@@ -323,6 +353,21 @@ def consult_po(state: DevLoopState) -> dict[str, Any]:
             a.model_copy(update={"answered_by": "product_owner"}) for a in run.artifact.answers
         ]
         facts["pending_questions"] = run.artifact.needs_human
+    return _advance(state, **facts)
+
+
+@_escalate_on_error
+def design(state: DevLoopState) -> dict[str, Any]:
+    """UX turns the requirements into screens the Planner can plan from —
+    with Stitch (or another design tool) when the role has one configured."""
+
+    spec = roles.DESIGN
+    run = _run(state, spec, _context(state, spec), check_design)
+    facts = _run_facts(state, spec, run)
+    if run.artifact is not None and run.artifact.questions_for_po:
+        facts.update(_ask_po(St.DESIGNING, run.artifact.questions_for_po))
+    elif run.artifact is not None:
+        facts.update(_ANSWERED, design=run.artifact)
     return _advance(state, **facts)
 
 

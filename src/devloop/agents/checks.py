@@ -11,6 +11,7 @@ from collections import Counter
 from pathlib import Path, PurePosixPath
 
 from devloop.contracts.artifacts import (
+    DesignResult,
     FileAction,
     Finding,
     ImplementationResult,
@@ -69,6 +70,18 @@ def check_requirements(req: RequirementResult) -> list[str]:
     if req.status.value == "ready" and not req.acceptance_criteria:
         return ["status is ready but acceptance_criteria is empty"]
     return []
+
+
+def check_design(design: DesignResult) -> list[str]:
+    if design.questions_for_po:
+        return []  # on hold until the questions are answered
+    problems: list[str] = []
+    if not design.screens:
+        problems.append("screens is empty; describe every screen or component the change touches")
+    dupes = [n for n, c in Counter(s.name for s in design.screens).items() if c > 1]
+    if dupes:
+        problems.append(f"screen names must be unique; duplicated: {', '.join(dupes)}")
+    return problems
 
 
 def _duplicate_ids(findings: list[Finding]) -> list[str]:

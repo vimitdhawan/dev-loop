@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from devloop.contracts.artifacts import Finding, QAVerdict
 from devloop.contracts.state import DevLoopState
-from devloop.graph.routing import latest_verification
+from devloop.graph.routing import latest_verification, workflow_of
 
 
 def render_summary(state: DevLoopState) -> str:
@@ -19,8 +19,16 @@ def render_summary(state: DevLoopState) -> str:
     review = state.get("review")
     out: list[str] = []
 
+    design = state.get("design")
+    workflow = workflow_of(state)
+
     out.append(f"## {task.title}\n")
-    if req is not None:
+    if task.url:
+        out.append(f"Closes {task.url}\n" if task.source == "github" else f"Source: {task.url}\n")
+    out.append(f"_Workflow **{workflow.name}**: {' → '.join(r.value for r in workflow.stages)}_\n")
+    if req is None:
+        out.append("_No Product Owner stage — the task description is the requirement._\n")
+    else:
         out.append(f"{req.summary}\n")
         out.append("### Acceptance criteria\n")
         out += [f"- {c}" for c in req.acceptance_criteria]
@@ -34,6 +42,14 @@ def render_summary(state: DevLoopState) -> str:
     if clarifications:
         out.append("### Clarifications\n")
         out += [f"- **{c.question}** — {c.answer} _({c.answered_by})_" for c in clarifications]
+        out.append("")
+
+    if design is not None:
+        out.append("### Design\n")
+        out.append(f"{design.summary}\n")
+        for screen in design.screens:
+            out.append(f"- **{screen.name}** — {screen.purpose}")
+        out += [f"- {r.tool}: `{r.ref}` {r.description}" for r in design.references]
         out.append("")
 
     if plan is not None:
